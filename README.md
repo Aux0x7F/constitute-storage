@@ -11,6 +11,7 @@ Storage is not key custody. It stores ciphertext, manifests, wrapped-key envelop
 - WebSocket watch channel for object availability, priority lanes, and critical acknowledgements.
 - CAAC Storage vocabulary from `constitute-protocol`.
 - Gateway/NVR proof target: safe structured event facts plus encrypted diagnostic detail refs.
+- Gateway installed-service inventory endpoint: `/hosted-service.json` exposes only safe service/version/capability hints.
 
 ## Run
 

@@ -11,6 +11,7 @@
 - Pin leases, owner unpin, expiry prune, and last-access prune.
 - Local materialized indexes populated by authorized decrypting agents.
 - Watch events for sync/progress/availability acknowledgements.
+- Safe hosted-service manifest and health projection for gateway installed-service inventory.
 
 ## Not Owned Here
 
@@ -21,6 +22,18 @@
 - Logging product semantics.
 - Notification/detection workflows.
 - DHT hot-query behavior.
+
+## Gateway Projection
+
+Storage is a gateway-hosted capability service, not an app launcher.
+It exposes safe service facts so `constitute-gateway` can publish it in the gateway hosted-services inventory:
+- service slug: `storage`
+- label and version
+- health endpoint hint
+- API endpoint hint
+- capability labels for objects, encrypted indexes, key grants, pinning, pruning, local search, and watch events
+
+The projection must not include wallet keys, grants, ciphertext payloads, decrypted metadata, access timing, or account/device secrets.
 
 ## Delete Semantics
 
