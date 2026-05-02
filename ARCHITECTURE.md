@@ -12,6 +12,7 @@
 - Local materialized indexes populated by authorized decrypting agents.
 - Watch events for sync/progress/availability acknowledgements.
 - Safe hosted-service manifest and health projection for gateway installed-service inventory.
+- Transactional archive substrate for encrypted logging objects, encrypted logging index shards, availability refs, and pin offers.
 
 ## Not Owned Here
 
@@ -20,6 +21,8 @@
 - Account identity authority.
 - Gateway grant policy.
 - Logging product semantics.
+- Service observation, cursoring, deduplication, correlation, or live-tail policy.
+- Decrypting log detail.
 - Notification/detection workflows.
 - DHT hot-query behavior.
 
@@ -44,3 +47,14 @@ The projection must not include wallet keys, grants, ciphertext payloads, decryp
 ## Index Model
 
 Encrypted index shards are synchronized as opaque ciphertext. Authorized clients or local service agents decrypt shards and submit safe materialized records for local search. V1 intentionally avoids blind server-side encrypted search.
+
+## Logging Archive Boundary
+
+`constitute-logging` is the first durable archive consumer. Storage remains transactional:
+- it accepts ciphertext, manifests, encrypted index shards, materialized safe records, availability refs, and pin leases
+- it does not observe Gateway/NVR directly
+- it does not formulate safe facts
+- it does not decrypt log detail
+- it does not decide incident/detection semantics
+
+Logging archive containers are per gateway by default. Availability and pin offers can be advertised, but other storage services decide whether to pin according to their own owner policy and capacity.
