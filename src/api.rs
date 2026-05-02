@@ -50,6 +50,7 @@ struct SearchQuery {
 pub fn router(engine: StorageEngine) -> Router {
     let state = ApiState { engine };
     Router::new()
+        .route("/hosted-service.json", get(hosted_service_manifest))
         .route("/health", get(health))
         .route("/v1/objects", post(put_object))
         .route(
@@ -67,6 +68,26 @@ pub fn router(engine: StorageEngine) -> Router {
         .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http())
         .with_state(state)
+}
+
+async fn hosted_service_manifest() -> impl IntoResponse {
+    Json(json!({
+        "service": "storage",
+        "deviceLabel": "Constitute Storage",
+        "serviceVersion": env!("CARGO_PKG_VERSION"),
+        "apiBaseUrl": "",
+        "healthUrl": "/health",
+        "capabilities": [
+            "encrypted_objects",
+            "content_addressed_chunks",
+            "encrypted_index_shards",
+            "key_grants",
+            "pin_leases",
+            "prune",
+            "local_search",
+            "watch"
+        ]
+    }))
 }
 
 async fn health(State(state): State<ApiState>) -> Result<impl IntoResponse, ApiError> {

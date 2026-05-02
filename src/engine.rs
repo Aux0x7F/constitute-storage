@@ -713,6 +713,42 @@ mod tests {
     }
 
     #[test]
+    fn materialized_index_accepts_logging_safe_facts() {
+        let dir = tempdir().expect("tempdir");
+        let engine = StorageEngine::open(dir.path()).expect("engine");
+        let entry = MaterializedIndexEntry {
+            entry_id: "log-event-1".to_string(),
+            container_id: "gateway-local-logs".to_string(),
+            record_type: "logEvent".to_string(),
+            subject: "nvr".to_string(),
+            priority: "warning".to_string(),
+            tags: vec!["nvr".to_string(), "worker".to_string()],
+            facts: serde_json::json!({
+                "service": "nvr",
+                "component": "projection",
+                "category": "worker",
+                "outcome": "recovered"
+            }),
+            detail_ref: None,
+            created_at: 1,
+        };
+        assert_eq!(
+            engine.materialize_entries(&[entry]).expect("materialize"),
+            1
+        );
+        let found = engine
+            .search(
+                Some("gateway-local-logs"),
+                Some("logEvent"),
+                Some("nvr"),
+                Some("worker"),
+            )
+            .expect("search");
+        assert_eq!(found.entries.len(), 1);
+        assert_eq!(found.entries[0].priority, "warning");
+    }
+
+    #[test]
     fn pin_retract_and_prune_separate_availability_from_access() {
         let dir = tempdir().expect("tempdir");
         let engine = StorageEngine::open(dir.path()).expect("engine");
