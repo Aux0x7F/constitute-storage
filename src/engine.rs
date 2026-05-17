@@ -7,9 +7,10 @@ use anyhow::{Context, Result, anyhow};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as B64;
 use constitute_protocol::{
-    StorageKeyGrant, StorageObjectManifest, StoragePinAttestation, StoragePinIntent,
-    StoragePinLease, StoragePinProjection, storage_pin_projection_from_intent,
-    storage_pin_projection_from_records, validate_storage_chunk_ref, validate_storage_index_shard,
+    RECORD_RETENTION_RELEASE, RetentionReleasePosture, StorageKeyGrant, StorageObjectManifest,
+    StoragePinAttestation, StoragePinIntent, StoragePinLease, StoragePinProjection,
+    storage_pin_projection_from_intent, storage_pin_projection_from_records,
+    validate_retention_release_posture, validate_storage_chunk_ref, validate_storage_index_shard,
     validate_storage_manifest, validate_storage_pin_attestation, validate_storage_pin_intent,
 };
 use rusqlite::{Connection, OptionalExtension, params};
@@ -530,14 +531,28 @@ impl StorageEngine {
             ))
         })?;
         let mut candidates = Vec::new();
+        let mut release_postures = Vec::new();
+        let mut blocked_chunks = 0usize;
         for row in rows {
             let (hash, path, size) = row?;
             let pinned: i64 = db.query_row(
-                "select count(*) from pin_leases where chunk_hash = ?1 or object_id in (select object_id from object_chunks where chunk_hash = ?1)",
+                "select count(*) from pin_leases where (chunk_hash = ?1 or object_id in (select object_id from object_chunks where chunk_hash = ?1)) and (expires_at is null or expires_at > ?2)",
+                params![hash, now],
+                |row| row.get(0),
+            )?;
+            let live_roots: i64 = db.query_row(
+                "select count(*) from object_chunks oc join objects o on o.object_id = oc.object_id where oc.chunk_hash = ?1 and o.logical_deleted_at is null",
                 params![hash],
                 |row| row.get(0),
             )?;
-            if pinned == 0 {
+            let posture =
+                storage_retention_release_posture(&request, &hash, now, pinned, live_roots)?;
+            let freeable = posture.state == "freeable";
+            if !freeable {
+                blocked_chunks += 1;
+            }
+            release_postures.push(posture);
+            if freeable {
                 candidates.push((hash, path, size));
             }
         }
@@ -568,8 +583,11 @@ impl StorageEngine {
         }
         Ok(PruneResponse {
             dry_run: request.dry_run,
+            evaluated_chunks: release_postures.len(),
+            blocked_chunks,
             pruned_chunks,
             pruned_bytes,
+            release_postures,
         })
     }
 
@@ -760,6 +778,85 @@ fn load_pin_attestations(conn: &Connection, intent_id: &str) -> Result<Vec<Stora
 fn decode_chunk(chunk: &PutChunk) -> Result<Vec<u8>> {
     B64.decode(chunk.ciphertext_base64.trim())
         .map_err(|_| anyhow!("storage chunk ciphertext is not base64"))
+}
+
+fn storage_retention_release_posture(
+    request: &PruneRequest,
+    chunk_hash: &str,
+    now: u64,
+    active_pins: i64,
+    live_roots: i64,
+) -> Result<RetentionReleasePosture> {
+    let effective_retention = normalize_storage_retention_class(&request.retention_class);
+    let mut blockers = Vec::new();
+    if active_pins > 0 {
+        blockers.push(serde_json::json!({
+            "code": "activePin",
+            "count": active_pins,
+        }));
+    }
+    if live_roots > 0 {
+        blockers.push(serde_json::json!({
+            "code": "liveRoot",
+            "count": live_roots,
+        }));
+    }
+    if !retention_allows_unfulfilled_release(&effective_retention)
+        && request.fulfillment_refs.is_empty()
+    {
+        blockers.push(serde_json::json!({ "code": "fulfillment.missing" }));
+    }
+    let posture = RetentionReleasePosture {
+        kind: Some(RECORD_RETENTION_RELEASE.to_string()),
+        evaluation_id: format!("storage-prune:{chunk_hash}:{now}"),
+        subject_ref: format!("storage:chunk:{chunk_hash}"),
+        effective_retention,
+        state: if blockers.is_empty() {
+            "freeable".to_string()
+        } else {
+            "releaseBlocked".to_string()
+        },
+        owner_refs: normalized_refs(&request.owner_refs, &["storage:local"]),
+        holder_refs: normalized_refs(&request.holder_refs, &["storage:local"]),
+        fulfillment_refs: normalized_refs(&request.fulfillment_refs, &[]),
+        residency_layers: normalized_refs(&request.residency_layers, &["storageLocalBlob"]),
+        blockers,
+        evaluated_at: now,
+    };
+    validate_retention_release_posture(&posture)?;
+    Ok(posture)
+}
+
+fn retention_allows_unfulfilled_release(retention_class: &str) -> bool {
+    matches!(
+        retention_class,
+        "ephemeral" | "disposable" | "session" | "cache"
+    )
+}
+
+fn normalize_storage_retention_class(value: &str) -> String {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        "durable".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn normalized_refs(values: &[String], defaults: &[&str]) -> Vec<String> {
+    let mut refs = Vec::new();
+    for value in values {
+        let trimmed = value.trim();
+        if !trimmed.is_empty() && !refs.iter().any(|item| item == trimmed) {
+            refs.push(trimmed.to_string());
+        }
+    }
+    for value in defaults {
+        if !value.is_empty() && !refs.iter().any(|item| item == value) {
+            refs.push((*value).to_string());
+        }
+    }
+    refs
 }
 
 pub fn now_seconds() -> u64 {
@@ -957,14 +1054,81 @@ mod tests {
             })
             .expect("dry prune");
         assert_eq!(dry.pruned_chunks, 0);
+        assert_eq!(dry.blocked_chunks, 1);
         engine.retract_pin("pin-1").expect("retract");
-        let pruned = engine
+        let blocked = engine
             .prune(PruneRequest {
                 dry_run: false,
                 ..Default::default()
             })
-            .expect("prune");
+            .expect("blocked prune");
+        assert_eq!(blocked.pruned_chunks, 0);
+        assert_eq!(blocked.blocked_chunks, 1);
+        assert_eq!(blocked.release_postures[0].state, "releaseBlocked");
+        engine
+            .logical_delete_object(&manifest.object_id, 1_700_000_000)
+            .expect("logical delete");
+        let pruned = engine
+            .prune(PruneRequest {
+                dry_run: false,
+                retention_class: "disposable".to_string(),
+                ..Default::default()
+            })
+            .expect("freeable prune");
         assert_eq!(pruned.pruned_chunks, 1);
+        assert_eq!(pruned.blocked_chunks, 0);
+        assert_eq!(pruned.release_postures[0].state, "freeable");
+        assert_eq!(
+            pruned.release_postures[0].kind.as_deref(),
+            Some(RECORD_RETENTION_RELEASE)
+        );
+    }
+
+    #[test]
+    fn storage_prune_requires_fulfillment_for_durable_release() {
+        let dir = tempdir().expect("tempdir");
+        let engine = StorageEngine::open(dir.path()).expect("engine");
+        let chunk = chunk(b"durable-ciphertext");
+        let manifest = manifest("container-a", "container-a:key", &chunk);
+        engine
+            .put_object(PutObjectRequest {
+                manifest: manifest.clone(),
+                chunks: vec![chunk],
+            })
+            .expect("put object");
+        engine
+            .logical_delete_object(&manifest.object_id, 1_700_000_000)
+            .expect("logical delete");
+        let blocked = engine
+            .prune(PruneRequest {
+                dry_run: true,
+                retention_class: "durable".to_string(),
+                ..Default::default()
+            })
+            .expect("blocked durable prune");
+        assert_eq!(blocked.pruned_chunks, 0);
+        assert_eq!(blocked.blocked_chunks, 1);
+        assert_eq!(blocked.release_postures[0].state, "releaseBlocked");
+        assert_eq!(
+            blocked.release_postures[0].blockers[0]["code"],
+            "fulfillment.missing"
+        );
+        let pruned = engine
+            .prune(PruneRequest {
+                dry_run: false,
+                retention_class: "durable".to_string(),
+                fulfillment_refs: vec!["storage-fulfillment:replica-2".to_string()],
+                owner_refs: vec!["identity:operator".to_string()],
+                ..Default::default()
+            })
+            .expect("fulfilled durable prune");
+        assert_eq!(pruned.pruned_chunks, 1);
+        assert_eq!(pruned.blocked_chunks, 0);
+        assert_eq!(pruned.release_postures[0].state, "freeable");
+        assert_eq!(
+            pruned.release_postures[0].fulfillment_refs,
+            vec!["storage-fulfillment:replica-2".to_string()]
+        );
     }
 
     fn pin_intent() -> StoragePinIntent {
