@@ -420,7 +420,7 @@ impl StorageEngine {
         let tx = db.unchecked_transaction()?;
         for entry in entries {
             tx.execute(
-                "insert or replace into materialized_entries (entry_id, container_id, record_type, subject, priority, tags_json, facts_json, detail_ref_json, created_at) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                "insert or replace into materialized_entries (entry_id, container_id, record_type, subject, priority, tags_json, facts_json, detail_ref_json, encrypted_detail_refs_json, created_at) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
                 params![
                     entry.entry_id,
                     entry.container_id,
@@ -430,6 +430,7 @@ impl StorageEngine {
                     serde_json::to_string(&entry.tags)?,
                     serde_json::to_string(&entry.facts)?,
                     serde_json::to_string(&entry.detail_ref)?,
+                    serde_json::to_string(&entry.encrypted_detail_refs)?,
                     entry.created_at
                 ],
             )?;
@@ -456,12 +457,13 @@ impl StorageEngine {
     ) -> Result<SearchResponse> {
         let db = self.lock_db()?;
         let mut stmt = db.prepare(
-            "select entry_id, container_id, record_type, subject, priority, tags_json, facts_json, detail_ref_json, created_at from materialized_entries order by created_at desc limit 500",
+            "select entry_id, container_id, record_type, subject, priority, tags_json, facts_json, detail_ref_json, encrypted_detail_refs_json, created_at from materialized_entries order by created_at desc limit 500",
         )?;
         let rows = stmt.query_map([], |row| {
             let tags_json: String = row.get(5)?;
             let facts_json: String = row.get(6)?;
             let detail_json: String = row.get(7)?;
+            let encrypted_detail_refs_json: String = row.get(8)?;
             Ok(MaterializedIndexEntry {
                 entry_id: row.get(0)?,
                 container_id: row.get(1)?,
@@ -471,7 +473,9 @@ impl StorageEngine {
                 tags: serde_json::from_str(&tags_json).unwrap_or_default(),
                 facts: serde_json::from_str(&facts_json).unwrap_or(serde_json::Value::Null),
                 detail_ref: serde_json::from_str(&detail_json).unwrap_or(None),
-                created_at: row.get(8)?,
+                encrypted_detail_refs: serde_json::from_str(&encrypted_detail_refs_json)
+                    .unwrap_or_default(),
+                created_at: row.get(9)?,
             })
         })?;
         let mut entries = Vec::new();
@@ -702,10 +706,23 @@ fn init_schema(conn: &Connection) -> Result<()> {
             tags_json text not null,
             facts_json text not null,
             detail_ref_json text not null,
+            encrypted_detail_refs_json text not null default '[]',
             created_at integer not null
         );
         "#,
     )?;
+    let has_encrypted_detail_refs = conn
+        .prepare("pragma table_info(materialized_entries)")?
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<std::result::Result<Vec<_>, _>>()?
+        .iter()
+        .any(|column| column == "encrypted_detail_refs_json");
+    if !has_encrypted_detail_refs {
+        conn.execute(
+            "alter table materialized_entries add column encrypted_detail_refs_json text not null default '[]'",
+            [],
+        )?;
+    }
     Ok(())
 }
 
@@ -836,6 +853,7 @@ mod tests {
             tags: vec!["gateway".to_string(), "health".to_string()],
             facts: serde_json::json!({"status": "ok"}),
             detail_ref: None,
+            encrypted_detail_refs: Vec::new(),
             created_at: 1,
         };
         assert_eq!(
@@ -870,7 +888,20 @@ mod tests {
                 "category": "worker",
                 "outcome": "recovered"
             }),
-            detail_ref: None,
+            detail_ref: Some(constitute_protocol::EncryptedDetailRef {
+                object_id: "object-log-detail-1".to_string(),
+                container_id: "gateway-local-logs".to_string(),
+                key_ref: "gateway-local-logs:key".to_string(),
+                manifest_hash: "sha256:log-detail-manifest".to_string(),
+                summary_tags: vec!["nvr".to_string(), "detail".to_string()],
+            }),
+            encrypted_detail_refs: vec![constitute_protocol::EncryptedDetailRef {
+                object_id: "object-log-detail-2".to_string(),
+                container_id: "gateway-local-logs".to_string(),
+                key_ref: "gateway-local-logs:key-secondary".to_string(),
+                manifest_hash: "sha256:log-detail-manifest-2".to_string(),
+                summary_tags: vec!["nvr".to_string(), "archive".to_string()],
+            }],
             created_at: 1,
         };
         assert_eq!(
@@ -887,6 +918,11 @@ mod tests {
             .expect("search");
         assert_eq!(found.entries.len(), 1);
         assert_eq!(found.entries[0].priority, "warning");
+        assert_eq!(found.entries[0].encrypted_detail_refs.len(), 1);
+        assert_eq!(
+            found.entries[0].encrypted_detail_refs[0].object_id,
+            "object-log-detail-2"
+        );
     }
 
     #[test]
@@ -1074,6 +1110,7 @@ mod tests {
             tags: vec!["logging".to_string()],
             facts: serde_json::json!({ "event": "archived" }),
             detail_ref: None,
+            encrypted_detail_refs: Vec::new(),
             created_at: 1_700_000_000_000,
         };
         let request = crate::types::MaterializeIndexRequest {
