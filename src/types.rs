@@ -1,6 +1,6 @@
 use constitute_protocol::{
     EncryptedDetailRef, StorageChunkRef, StorageIndexShard, StorageKeyGrant, StorageObjectManifest,
-    StoragePinLease,
+    StoragePinAttestation, StoragePinIntent, StoragePinLease, StoragePinProjection,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -60,6 +60,32 @@ pub struct PutPinRequest {
     pub pin: StoragePinLease,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PutPinIntentRequest {
+    pub intent: StoragePinIntent,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PutPinAttestationRequest {
+    pub attestation: StoragePinAttestation,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StoragePinIntentResponse {
+    pub intent: StoragePinIntent,
+    pub projection: StoragePinProjection,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StoragePinAttestationResponse {
+    pub attestation: StoragePinAttestation,
+    pub projection: StoragePinProjection,
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PruneRequest {
@@ -105,6 +131,8 @@ pub struct MaterializedIndexEntry {
 #[serde(rename_all = "camelCase")]
 pub struct MaterializeIndexRequest {
     pub entries: Vec<MaterializedIndexEntry>,
+    #[serde(default)]
+    pub pin_intents: Vec<StoragePinIntent>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -122,6 +150,8 @@ pub struct StorageHealth {
     pub index_shards: u64,
     pub key_grants: u64,
     pub pin_leases: u64,
+    pub pin_intents: u64,
+    pub pin_attestations: u64,
     pub materialized_entries: u64,
 }
 

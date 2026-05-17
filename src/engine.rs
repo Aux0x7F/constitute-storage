@@ -7,8 +7,10 @@ use anyhow::{Context, Result, anyhow};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as B64;
 use constitute_protocol::{
-    StorageKeyGrant, StorageObjectManifest, StoragePinLease, validate_storage_chunk_ref,
-    validate_storage_index_shard, validate_storage_manifest,
+    StorageKeyGrant, StorageObjectManifest, StoragePinAttestation, StoragePinIntent,
+    StoragePinLease, StoragePinProjection, storage_pin_projection_from_intent,
+    storage_pin_projection_from_records, validate_storage_chunk_ref, validate_storage_index_shard,
+    validate_storage_manifest, validate_storage_pin_attestation, validate_storage_pin_intent,
 };
 use rusqlite::{Connection, OptionalExtension, params};
 use tokio::sync::broadcast;
@@ -16,7 +18,8 @@ use uuid::Uuid;
 
 use crate::types::{
     GetObjectResponse, MaterializedIndexEntry, PruneRequest, PruneResponse, PutChunk,
-    PutIndexShardRequest, PutObjectRequest, SearchResponse, StorageHealth, StorageWatchEvent,
+    PutIndexShardRequest, PutObjectRequest, SearchResponse, StorageHealth,
+    StoragePinAttestationResponse, StoragePinIntentResponse, StorageWatchEvent,
     StoredIndexShardResponse, StoredObjectResponse,
 };
 
@@ -68,6 +71,8 @@ impl StorageEngine {
             index_shards: count_table(&db, "index_shards")?,
             key_grants: count_table(&db, "key_grants")?,
             pin_leases: count_table(&db, "pin_leases")?,
+            pin_intents: count_table(&db, "pin_intents")?,
+            pin_attestations: count_table(&db, "pin_attestations")?,
             materialized_entries: count_table(&db, "materialized_entries")?,
         })
     }
@@ -260,6 +265,91 @@ impl StorageEngine {
         Ok(grant)
     }
 
+    pub fn put_pin_intent(&self, intent: StoragePinIntent) -> Result<StoragePinIntentResponse> {
+        validate_storage_pin_intent(&intent)?;
+        let projection = storage_pin_projection_from_intent(&intent)?;
+        let db = self.lock_db()?;
+        db.execute(
+            "insert or replace into pin_intents (intent_id, manifest_hash, desired_replicas, intent_json, projection_json, created_at, expires_at) values (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                intent.intent_id,
+                intent.manifest_hash,
+                intent.desired_replicas,
+                serde_json::to_string(&intent)?,
+                serde_json::to_string(&projection)?,
+                now_seconds(),
+                intent.expires_at
+            ],
+        )?;
+        self.emit(
+            "pin_intent.stored",
+            "normal",
+            None,
+            None,
+            "storage pin intent projection pending",
+        );
+        Ok(StoragePinIntentResponse { intent, projection })
+    }
+
+    pub fn put_pin_attestation(
+        &self,
+        attestation: StoragePinAttestation,
+        now: u64,
+    ) -> Result<StoragePinAttestationResponse> {
+        validate_storage_pin_attestation(&attestation)?;
+        let db = self.lock_db()?;
+        let intent = load_pin_intent(&db, &attestation.intent_id)?
+            .ok_or_else(|| anyhow!("storage pin intent not found"))?;
+        db.execute(
+            "insert or replace into pin_attestations (attestation_id, intent_id, storage_member_ref, status, attestation_json, issued_at, expires_at) values (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                attestation.attestation_id,
+                attestation.intent_id,
+                attestation.storage_member_ref,
+                serde_json::to_string(&attestation.status)?,
+                serde_json::to_string(&attestation)?,
+                attestation.issued_at,
+                attestation.expires_at
+            ],
+        )?;
+        let projection = self.derive_and_store_pin_projection(&db, &intent, now)?;
+        self.emit(
+            "pin_attestation.stored",
+            "normal",
+            None,
+            None,
+            "storage pin attestation projection updated",
+        );
+        Ok(StoragePinAttestationResponse {
+            attestation,
+            projection,
+        })
+    }
+
+    pub fn pin_projection(&self, intent_id: &str, now: u64) -> Result<StoragePinProjection> {
+        let db = self.lock_db()?;
+        let intent = load_pin_intent(&db, intent_id)?
+            .ok_or_else(|| anyhow!("storage pin intent not found"))?;
+        self.derive_and_store_pin_projection(&db, &intent, now)
+    }
+
+    fn derive_and_store_pin_projection(
+        &self,
+        db: &Connection,
+        intent: &StoragePinIntent,
+        now: u64,
+    ) -> Result<StoragePinProjection> {
+        let attestations = load_pin_attestations(db, &intent.intent_id)?;
+        let projection = storage_pin_projection_from_records(intent, &attestations, now)?;
+        db.execute(
+            "update pin_intents set projection_json = ?1 where intent_id = ?2",
+            params![serde_json::to_string(&projection)?, intent.intent_id],
+        )?;
+        Ok(projection)
+    }
+
+    // Legacy direct storage route bridge: retained below the protocol boundary for
+    // local smoke tests and prune mechanics while swarm pin records land.
     pub fn put_pin(&self, pin: StoragePinLease) -> Result<StoragePinLease> {
         if pin.pin_id.trim().is_empty() || pin.container_id.trim().is_empty() {
             return Err(anyhow!("storage pin missing required fields"));
@@ -585,6 +675,24 @@ fn init_schema(conn: &Connection) -> Result<()> {
             expires_at integer,
             last_accessed_at integer
         );
+        create table if not exists pin_intents (
+            intent_id text primary key,
+            manifest_hash text not null,
+            desired_replicas integer not null,
+            intent_json text not null,
+            projection_json text not null,
+            created_at integer not null,
+            expires_at integer
+        );
+        create table if not exists pin_attestations (
+            attestation_id text primary key,
+            intent_id text not null,
+            storage_member_ref text not null,
+            status text not null,
+            attestation_json text not null,
+            issued_at integer not null,
+            expires_at integer
+        );
         create table if not exists materialized_entries (
             entry_id text primary key,
             container_id text not null,
@@ -607,6 +715,31 @@ fn count_table(conn: &Connection, table: &str) -> Result<u64> {
     Ok(count as u64)
 }
 
+fn load_pin_intent(conn: &Connection, intent_id: &str) -> Result<Option<StoragePinIntent>> {
+    let intent_json: Option<String> = conn
+        .query_row(
+            "select intent_json from pin_intents where intent_id = ?1",
+            params![intent_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    intent_json
+        .map(|json| serde_json::from_str(&json).context("decode storage pin intent"))
+        .transpose()
+}
+
+fn load_pin_attestations(conn: &Connection, intent_id: &str) -> Result<Vec<StoragePinAttestation>> {
+    let mut stmt = conn.prepare(
+        "select attestation_json from pin_attestations where intent_id = ?1 order by issued_at asc, attestation_id asc",
+    )?;
+    let rows = stmt.query_map(params![intent_id], |row| row.get::<_, String>(0))?;
+    let mut attestations = Vec::new();
+    for row in rows {
+        attestations.push(serde_json::from_str(&row?)?);
+    }
+    Ok(attestations)
+}
+
 fn decode_chunk(chunk: &PutChunk) -> Result<Vec<u8>> {
     B64.decode(chunk.ciphertext_base64.trim())
         .map_err(|_| anyhow!("storage chunk ciphertext is not base64"))
@@ -619,12 +752,20 @@ pub fn now_seconds() -> u64 {
         .as_secs()
 }
 
+pub fn now_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
 #[cfg(test)]
 mod tests {
     use constitute_protocol::{
         STORAGE_CHUNK_HASH_ALG, STORAGE_ENCRYPTION_ALG_XCHACHA20POLY1305, STORAGE_OBJECT_HASH_ALG,
-        StorageChunkRef, StorageObjectManifest, storage_chunk_id, storage_ciphertext_hash,
-        storage_object_id,
+        StorageChunkRef, StorageObjectManifest, StoragePinAttestation, StoragePinIntent,
+        StoragePinProjectionStatus, StoragePinStatus, SwarmStorageAvailabilityRef,
+        storage_chunk_id, storage_ciphertext_hash, storage_object_id,
     };
     use tempfile::tempdir;
 
@@ -749,7 +890,7 @@ mod tests {
     }
 
     #[test]
-    fn pin_retract_and_prune_separate_availability_from_access() {
+    fn legacy_pin_lease_bridge_retract_and_prune_separate_availability_from_access() {
         let dir = tempdir().expect("tempdir");
         let engine = StorageEngine::open(dir.path()).expect("engine");
         let chunk = chunk(b"ciphertext");
@@ -788,5 +929,160 @@ mod tests {
             })
             .expect("prune");
         assert_eq!(pruned.pruned_chunks, 1);
+    }
+
+    fn pin_intent() -> StoragePinIntent {
+        StoragePinIntent {
+            intent_id: "intent-1".to_string(),
+            object_refs: vec!["object-raw-1".to_string()],
+            manifest_hash: "sha256:manifest".to_string(),
+            desired_replicas: 2,
+            retention: "proof".to_string(),
+            authority_refs: vec!["authority-raw-1".to_string()],
+            expires_at: Some(1_700_000_100_000),
+        }
+    }
+
+    fn pin_attestation(
+        attestation_id: &str,
+        member_ref: &str,
+        status: StoragePinStatus,
+        expires_at: Option<u64>,
+    ) -> StoragePinAttestation {
+        StoragePinAttestation {
+            attestation_id: attestation_id.to_string(),
+            intent_id: "intent-1".to_string(),
+            storage_member_ref: member_ref.to_string(),
+            accepted_refs: vec!["object-raw-1".to_string()],
+            availability_refs: vec![SwarmStorageAvailabilityRef {
+                availability_id: format!("availability-{attestation_id}"),
+                object_ref: "object-raw-1".to_string(),
+                storage_member_ref: member_ref.to_string(),
+                expires_at,
+            }],
+            status,
+            expires_at,
+            issued_at: 1_700_000_000_000,
+        }
+    }
+
+    #[test]
+    fn storage_pin_intent_creates_pending_projection_state() {
+        let dir = tempdir().expect("tempdir");
+        let engine = StorageEngine::open(dir.path()).expect("engine");
+        let response = engine.put_pin_intent(pin_intent()).expect("put pin intent");
+        assert_eq!(response.projection.pinned_count, 0);
+        assert_eq!(response.projection.missing_replicas, 2);
+        assert_eq!(
+            response.projection.status,
+            StoragePinProjectionStatus::Pending
+        );
+
+        let projection = engine
+            .pin_projection("intent-1", 1_700_000_000_000)
+            .expect("projection");
+        assert_eq!(projection.status, StoragePinProjectionStatus::Pending);
+        assert_eq!(projection.missing_replicas, 2);
+    }
+
+    #[test]
+    fn storage_pin_attestations_update_derived_projection() {
+        let dir = tempdir().expect("tempdir");
+        let engine = StorageEngine::open(dir.path()).expect("engine");
+        engine.put_pin_intent(pin_intent()).expect("put pin intent");
+
+        let first = engine
+            .put_pin_attestation(
+                pin_attestation(
+                    "attestation-1",
+                    "storage-member-raw-2",
+                    StoragePinStatus::Accepted,
+                    Some(1_700_000_100_000),
+                ),
+                1_700_000_000_000,
+            )
+            .expect("first attestation");
+        assert_eq!(first.projection.pinned_count, 1);
+        assert_eq!(first.projection.missing_replicas, 1);
+
+        let second = engine
+            .put_pin_attestation(
+                pin_attestation(
+                    "attestation-2",
+                    "storage-member-raw-1",
+                    StoragePinStatus::Pinned,
+                    Some(1_700_000_100_000),
+                ),
+                1_700_000_000_000,
+            )
+            .expect("second attestation");
+        assert_eq!(second.projection.pinned_count, 2);
+        assert_eq!(second.projection.missing_replicas, 0);
+        assert_eq!(
+            second.projection.status,
+            StoragePinProjectionStatus::Satisfied
+        );
+        assert_eq!(
+            second.projection.members,
+            vec![
+                "storage-member-raw-1".to_string(),
+                "storage-member-raw-2".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn expired_storage_pin_attestation_no_longer_counts() {
+        let dir = tempdir().expect("tempdir");
+        let engine = StorageEngine::open(dir.path()).expect("engine");
+        engine.put_pin_intent(pin_intent()).expect("put pin intent");
+        engine
+            .put_pin_attestation(
+                pin_attestation(
+                    "attestation-1",
+                    "storage-member-raw-1",
+                    StoragePinStatus::Accepted,
+                    Some(1_700_000_000_010),
+                ),
+                1_700_000_000_000,
+            )
+            .expect("attestation");
+
+        let active = engine
+            .pin_projection("intent-1", 1_700_000_000_009)
+            .expect("active projection");
+        assert_eq!(active.pinned_count, 1);
+
+        let expired = engine
+            .pin_projection("intent-1", 1_700_000_000_010)
+            .expect("expired projection");
+        assert_eq!(expired.pinned_count, 0);
+        assert_eq!(expired.missing_replicas, 2);
+        assert_eq!(expired.status, StoragePinProjectionStatus::Pending);
+    }
+
+    #[test]
+    fn materialized_index_request_can_carry_storage_pin_intents() {
+        let intent = pin_intent();
+        validate_storage_pin_intent(&intent).expect("valid intent carried beside index");
+        let entry = MaterializedIndexEntry {
+            entry_id: "entry-with-pin".to_string(),
+            container_id: "container-a".to_string(),
+            record_type: "logEvent".to_string(),
+            subject: "logging".to_string(),
+            priority: "normal".to_string(),
+            tags: vec!["logging".to_string()],
+            facts: serde_json::json!({ "event": "archived" }),
+            detail_ref: None,
+            created_at: 1_700_000_000_000,
+        };
+        let request = crate::types::MaterializeIndexRequest {
+            entries: vec![entry],
+            pin_intents: vec![intent],
+        };
+        let serialized = serde_json::to_string(&request).expect("json");
+        assert!(serialized.contains("pinIntents"));
+        assert!(!serialized.contains("mediaBytes"));
+        assert!(!serialized.contains("blobBytes"));
     }
 }
