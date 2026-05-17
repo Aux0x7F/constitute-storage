@@ -1,6 +1,7 @@
 use constitute_protocol::{
-    EncryptedDetailRef, StorageChunkRef, StorageIndexShard, StorageKeyGrant, StorageObjectManifest,
-    StoragePinAttestation, StoragePinIntent, StoragePinLease, StoragePinProjection,
+    EncryptedDetailRef, RetentionReleasePosture, StorageChunkRef, StorageIndexShard,
+    StorageKeyGrant, StorageObjectManifest, StoragePinAttestation, StoragePinIntent,
+    StoragePinLease, StoragePinProjection,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -99,14 +100,26 @@ pub struct PruneRequest {
     pub retention_class: String,
     #[serde(default)]
     pub max_bytes: Option<u64>,
+    #[serde(default)]
+    pub owner_refs: Vec<String>,
+    #[serde(default)]
+    pub holder_refs: Vec<String>,
+    #[serde(default)]
+    pub fulfillment_refs: Vec<String>,
+    #[serde(default)]
+    pub residency_layers: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PruneResponse {
     pub dry_run: bool,
+    pub evaluated_chunks: usize,
+    pub blocked_chunks: usize,
     pub pruned_chunks: usize,
     pub pruned_bytes: u64,
+    #[serde(default)]
+    pub release_postures: Vec<RetentionReleasePosture>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
