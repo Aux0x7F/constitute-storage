@@ -1,0 +1,763 @@
+use anyhow::{Context, Result};
+use constitute_protocol::{
+    CAPABILITY_SWARM_EDGE_ATTACH, SWARM_EDGE_WIRE_ACCEPT, SWARM_EDGE_WIRE_HELLO,
+    SWARM_EDGE_WIRE_RESUME, SWARM_FRAME_VERSION, SWARM_WIRE_FRAME, SwarmAck, SwarmEdgeAccept,
+    SwarmEdgeHello, SwarmFrame, SwarmFrameBody, SwarmFrameKind, ZoneScope, seal_envelope,
+    swarm_frame_id, validate_swarm_edge_hello, validate_swarm_frame,
+};
+use futures_util::{SinkExt, StreamExt};
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
+use std::time::Duration;
+use tokio::sync::{mpsc, oneshot};
+use tokio::time::timeout;
+use tokio_tungstenite::connect_async;
+use tokio_tungstenite::tungstenite::Message;
+
+use crate::api::{self, ApiState, STORAGE_CHANNELS, STORAGE_EDGE_CAPABILITIES};
+use crate::engine::now_millis;
+
+#[derive(Clone, Debug)]
+pub struct SwarmEdgeClientConfig {
+    pub gateway_endpoint: String,
+    pub member_ref: String,
+    pub service_pk: String,
+    pub service_sk_hex: String,
+    pub zone_id: String,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct SwarmEdgeClientState {
+    pub session_id: Option<String>,
+    pub last_acked_frame_id: Option<String>,
+    pub rejects: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type")]
+enum GatewayWireMessage {
+    #[serde(rename = "swarm.edge.accept")]
+    Accept { accept: SwarmEdgeAccept },
+    #[serde(rename = "swarm.edge.resume")]
+    Resume { accept: SwarmEdgeAccept },
+    #[serde(rename = "swarm.frame")]
+    Frame { frame: SwarmFrame },
+    #[serde(other)]
+    Unsupported,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(tag = "type")]
+enum ServiceWireMessage<'a> {
+    #[serde(rename = "swarm.edge.hello")]
+    Hello { hello: &'a SwarmEdgeHello },
+    #[serde(rename = "swarm.frame")]
+    Frame { frame: &'a SwarmFrame },
+}
+
+pub fn default_config(
+    gateway_endpoint: String,
+    zone_id: String,
+    service_pk: String,
+    service_sk_hex: String,
+) -> SwarmEdgeClientConfig {
+    SwarmEdgeClientConfig {
+        gateway_endpoint,
+        member_ref: service_pk.clone(),
+        service_pk,
+        service_sk_hex,
+        zone_id,
+    }
+}
+
+pub fn build_hello(config: &SwarmEdgeClientConfig, now: u64) -> SwarmEdgeHello {
+    let service_ref = format!("service:storage:{}", config.service_pk.trim());
+    let promise_refs = vec![service_ref.clone(), config.service_pk.trim().to_string()];
+    SwarmEdgeHello {
+        member_kind: "service".to_string(),
+        member_ref: config.member_ref.clone(),
+        zone_scope: ZoneScope {
+            zone_id: config.zone_id.clone(),
+            privacy: Some("rawIds".to_string()),
+            ttl: Some(30),
+            max_hops: Some(2),
+        },
+        supported_versions: vec![SWARM_FRAME_VERSION as u32],
+        last_acked_frame_id: None,
+        last_projection_revisions: json!({}),
+        capability_refs: std::iter::once(CAPABILITY_SWARM_EDGE_ATTACH.to_string())
+            .chain(
+                STORAGE_EDGE_CAPABILITIES
+                    .iter()
+                    .map(|value| value.to_string()),
+            )
+            .collect(),
+        channel_refs: STORAGE_CHANNELS
+            .iter()
+            .map(|value| value.to_string())
+            .collect(),
+        promise_refs: promise_refs.clone(),
+        nonce: format!("storage-edge-hello-{now}"),
+        issued_at: now,
+        expires_at: Some(now + 60_000),
+        sealed_claims: SwarmFrameBody {
+            encoding: "caac".to_string(),
+            envelope: constitute_protocol::seal_envelope(
+                "swarm.edge.claims",
+                &json!({
+                    "service": "storage",
+                    "memberRef": config.member_ref.clone(),
+                    "serviceRef": service_ref,
+                    "servicePk": config.service_pk.clone(),
+                    "capabilityRefs": STORAGE_EDGE_CAPABILITIES,
+                    "channelRefs": STORAGE_CHANNELS,
+                    "promiseRefs": promise_refs,
+                }),
+                &config.service_sk_hex,
+                std::slice::from_ref(&config.service_pk),
+                now,
+                now + 60_000,
+            )
+            .ok()
+            .and_then(|envelope| serde_json::to_value(envelope).ok()),
+            public_bootstrap: false,
+            payload: None,
+            signature: None,
+        },
+    }
+}
+
+pub fn validate_hello(hello: &SwarmEdgeHello) -> Result<()> {
+    validate_swarm_edge_hello(hello).map_err(Into::into)
+}
+
+pub async fn run_swarm_edge_client(state: ApiState, config: SwarmEdgeClientConfig) -> Result<()> {
+    loop {
+        match run_swarm_edge_client_once(&state, &config).await {
+            Ok(()) => tracing::warn!(
+                endpoint = %config.gateway_endpoint,
+                "storage gateway edge stream closed"
+            ),
+            Err(err) => tracing::warn!(
+                endpoint = %config.gateway_endpoint,
+                error = %err,
+                "storage gateway edge stream failed"
+            ),
+        }
+        tokio::time::sleep(Duration::from_secs(5)).await;
+    }
+}
+
+async fn run_swarm_edge_client_once(
+    state: &ApiState,
+    config: &SwarmEdgeClientConfig,
+) -> Result<()> {
+    let (ws, _) = connect_async(&config.gateway_endpoint)
+        .await
+        .with_context(|| format!("connect storage edge client to {}", config.gateway_endpoint))?;
+    let (mut sink, mut stream) = ws.split();
+    let mut client_state = SwarmEdgeClientState::default();
+    let hello = build_hello(&config, now_millis());
+    validate_hello(&hello)?;
+    let hello_text = serde_json::to_string(&ServiceWireMessage::Hello { hello: &hello })?;
+    timeout(
+        Duration::from_millis(STORAGE_EDGE_WRITE_TIMEOUT_MS),
+        sink.send(Message::Text(hello_text)),
+    )
+    .await
+    .context("timed out sending storage edge hello")??;
+
+    let (frame_tx, mut frame_rx) =
+        mpsc::channel::<(SwarmFrame, u64)>(STORAGE_EDGE_FRAME_WORK_QUEUE);
+    let (out_tx, mut out_rx) = mpsc::channel::<SwarmFrame>(STORAGE_EDGE_RESPONSE_QUEUE);
+    let worker_state = (*state).clone();
+    let worker_out = out_tx.clone();
+    let frame_worker = tokio::spawn(async move {
+        while let Some((frame, now)) = frame_rx.recv().await {
+            let frame_id = frame.frame_id.clone();
+            match timeout(
+                Duration::from_millis(STORAGE_EDGE_FRAME_WORK_TIMEOUT_MS),
+                process_gateway_work_frame(&worker_state, frame, now),
+            )
+            .await
+            {
+                Ok(frames) => {
+                    for frame in frames {
+                        if worker_out.send(frame).await.is_err() {
+                            return;
+                        }
+                    }
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        frame_id = %frame_id,
+                        timeout_ms = STORAGE_EDGE_FRAME_WORK_TIMEOUT_MS,
+                        "storage edge worker timed out before service response"
+                    );
+                }
+            }
+        }
+    });
+
+    let (writer_done_tx, mut writer_done_rx) = oneshot::channel::<()>();
+    let frame_writer = tokio::spawn(async move {
+        while let Some(frame) = out_rx.recv().await {
+            let frame_id = frame.frame_id.clone();
+            let text = match serde_json::to_string(&ServiceWireMessage::Frame { frame: &frame }) {
+                Ok(text) => text,
+                Err(err) => {
+                    tracing::warn!(
+                        frame_id = %frame_id,
+                        error = %err,
+                        "failed to encode storage edge outbound frame"
+                    );
+                    continue;
+                }
+            };
+            match timeout(
+                Duration::from_millis(STORAGE_EDGE_WRITE_TIMEOUT_MS),
+                sink.send(Message::Text(text)),
+            )
+            .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(err)) => {
+                    tracing::warn!(
+                        frame_id = %frame_id,
+                        error = %err,
+                        "failed to send storage edge outbound frame"
+                    );
+                    break;
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        frame_id = %frame_id,
+                        timeout_ms = STORAGE_EDGE_WRITE_TIMEOUT_MS,
+                        "timed out sending storage edge outbound frame"
+                    );
+                    break;
+                }
+            }
+        }
+        let _ = writer_done_tx.send(());
+    });
+
+    loop {
+        tokio::select! {
+            _ = &mut writer_done_rx => {
+                break;
+            }
+            message = stream.next() => {
+                let Some(message) = message else {
+                    break;
+                };
+                let message = message?;
+                let Message::Text(text) = message else {
+                    continue;
+                };
+                handle_gateway_text_for_queue(
+                    state,
+                    &mut client_state,
+                    &text,
+                    now_millis(),
+                    &frame_tx,
+                    &out_tx,
+                )
+                .await?;
+            }
+        }
+    }
+    drop(frame_tx);
+    drop(out_tx);
+    let _ = frame_worker.await;
+    let _ = frame_writer.await;
+    Ok(())
+}
+
+pub async fn handle_gateway_text(
+    state: &ApiState,
+    client_state: &mut SwarmEdgeClientState,
+    text: &str,
+    now: u64,
+) -> Result<Vec<SwarmFrame>> {
+    let message: GatewayWireMessage = serde_json::from_str(text)?;
+    match message {
+        GatewayWireMessage::Accept { accept } | GatewayWireMessage::Resume { accept } => {
+            tracing::info!(
+                session_id = %accept.session_id,
+                "storage attached to gateway edge stream"
+            );
+            client_state.session_id = Some(accept.session_id);
+            Ok(Vec::new())
+        }
+        GatewayWireMessage::Frame { frame } => {
+            handle_gateway_frame(state, client_state, frame, now).await
+        }
+        GatewayWireMessage::Unsupported => Ok(Vec::new()),
+    }
+}
+
+async fn handle_gateway_text_for_queue(
+    state: &ApiState,
+    client_state: &mut SwarmEdgeClientState,
+    text: &str,
+    now: u64,
+    frame_tx: &mpsc::Sender<(SwarmFrame, u64)>,
+    out_tx: &mpsc::Sender<SwarmFrame>,
+) -> Result<()> {
+    let value: Value = match serde_json::from_str(text) {
+        Ok(value) => value,
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                "storage edge ignored malformed gateway wire json"
+            );
+            return Ok(());
+        }
+    };
+
+    let message: GatewayWireMessage = match serde_json::from_value(value) {
+        Ok(message) => message,
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                "storage edge ignored malformed gateway wire message"
+            );
+            return Ok(());
+        }
+    };
+    match message {
+        GatewayWireMessage::Accept { accept } | GatewayWireMessage::Resume { accept } => {
+            tracing::info!(
+                session_id = %accept.session_id,
+                "storage attached to gateway edge stream"
+            );
+            client_state.session_id = Some(accept.session_id);
+        }
+        GatewayWireMessage::Frame { frame } => {
+            admit_storage_gateway_frame(state, client_state, frame, now, frame_tx, out_tx);
+        }
+        GatewayWireMessage::Unsupported => {}
+    }
+    Ok(())
+}
+
+fn admit_storage_gateway_frame(
+    state: &ApiState,
+    client_state: &mut SwarmEdgeClientState,
+    frame: SwarmFrame,
+    now: u64,
+    frame_tx: &mpsc::Sender<(SwarmFrame, u64)>,
+    out_tx: &mpsc::Sender<SwarmFrame>,
+) {
+    if handle_ack_reject(client_state, &frame) {
+        return;
+    }
+    let frame_id = frame.frame_id.clone();
+    match frame_tx.try_send((frame, now)) {
+        Ok(()) => {}
+        Err(mpsc::error::TrySendError::Full((frame, _)))
+        | Err(mpsc::error::TrySendError::Closed((frame, _))) => {
+            tracing::warn!(
+                frame_id = %frame_id,
+                "storage edge frame work queue saturated; rejecting gateway frame before service processing"
+            );
+            if let Some(reject_frame) = storage_reject_frame(
+                state,
+                &frame,
+                now,
+                "storage_edge_overloaded",
+                "storage edge work queue saturated before service processing",
+            ) {
+                try_send_storage_edge_response(out_tx, reject_frame);
+            }
+        }
+    }
+}
+
+fn try_send_storage_edge_response(out_tx: &mpsc::Sender<SwarmFrame>, frame: SwarmFrame) {
+    let frame_id = frame.frame_id.clone();
+    if let Err(err) = out_tx.try_send(frame) {
+        tracing::warn!(
+            frame_id = %frame_id,
+            error = %err,
+            "storage edge response queue saturated"
+        );
+    }
+}
+
+async fn process_gateway_work_frame(
+    state: &ApiState,
+    frame: SwarmFrame,
+    now: u64,
+) -> Vec<SwarmFrame> {
+    match api::process_gateway_frame(state, frame.clone(), now) {
+        Ok(frames) => frames,
+        Err(err) => {
+            tracing::warn!(
+                frame_id = %frame.frame_id,
+                kind = ?frame.kind,
+                channel_id = ?frame.channel_id,
+                error = %err,
+                "storage edge rejected gateway frame without dropping stream"
+            );
+            storage_reject_frame(
+                state,
+                &frame,
+                now,
+                "storage_frame_rejected",
+                &err.to_string(),
+            )
+            .into_iter()
+            .collect()
+        }
+    }
+}
+
+pub async fn handle_gateway_frame(
+    state: &ApiState,
+    client_state: &mut SwarmEdgeClientState,
+    frame: SwarmFrame,
+    now: u64,
+) -> Result<Vec<SwarmFrame>> {
+    if handle_ack_reject(client_state, &frame) {
+        return Ok(Vec::new());
+    }
+    match api::process_gateway_frame(state, frame.clone(), now) {
+        Ok(frames) => Ok(frames),
+        Err(err) => {
+            tracing::warn!(
+                frame_id = %frame.frame_id,
+                kind = ?frame.kind,
+                channel_id = ?frame.channel_id,
+                error = %err,
+                "storage edge rejected gateway frame without dropping stream"
+            );
+            Ok(storage_reject_frame(
+                state,
+                &frame,
+                now,
+                "storage_frame_rejected",
+                &err.to_string(),
+            )
+            .into_iter()
+            .collect())
+        }
+    }
+}
+
+fn handle_ack_reject(client_state: &mut SwarmEdgeClientState, frame: &SwarmFrame) -> bool {
+    match frame.kind {
+        SwarmFrameKind::Ack => {
+            client_state.last_acked_frame_id = frame
+                .ack
+                .as_ref()
+                .and_then(|ack| ack.acked_frame_id.clone())
+                .or_else(|| frame.correlation_id.clone());
+            true
+        }
+        SwarmFrameKind::Reject => {
+            let reason = frame
+                .ack
+                .as_ref()
+                .and_then(|ack| ack.reason_code.clone())
+                .unwrap_or_else(|| "rejected".to_string());
+            client_state.rejects.push(reason);
+            true
+        }
+        _ => false,
+    }
+}
+
+pub fn wire_kind(value: &Value) -> Option<&str> {
+    value.get("type").and_then(Value::as_str)
+}
+
+pub const HELLO_WIRE_KIND: &str = SWARM_EDGE_WIRE_HELLO;
+pub const ACCEPT_WIRE_KIND: &str = SWARM_EDGE_WIRE_ACCEPT;
+pub const RESUME_WIRE_KIND: &str = SWARM_EDGE_WIRE_RESUME;
+pub const FRAME_WIRE_KIND: &str = SWARM_WIRE_FRAME;
+
+const REJECT_TTL_MS: u64 = 60_000;
+const STORAGE_EDGE_FRAME_WORK_QUEUE: usize = 256;
+const STORAGE_EDGE_RESPONSE_QUEUE: usize = 256;
+const STORAGE_EDGE_FRAME_WORK_TIMEOUT_MS: u64 = 5_000;
+const STORAGE_EDGE_WRITE_TIMEOUT_MS: u64 = 2_000;
+
+fn storage_reject_frame(
+    state: &ApiState,
+    source_frame: &SwarmFrame,
+    now: u64,
+    reason_code: &str,
+    detail: &str,
+) -> Option<SwarmFrame> {
+    let recipients = response_recipients(state, Some(source_frame.issuer.as_str()));
+    if recipients.is_empty() {
+        tracing::warn!(
+            frame_id = %source_frame.frame_id,
+            "storage edge could not reject frame because no response recipient was recoverable"
+        );
+        return None;
+    }
+    let service_ref = format!("service:storage:{}", state.service_identity.service_pk);
+    let envelope = seal_envelope(
+        "storage.edge.reject",
+        &json!({
+            "reasonCode": reason_code,
+            "detail": detail,
+            "sourceFrameId": source_frame.frame_id,
+        }),
+        &state.service_identity.service_sk_hex,
+        &recipients,
+        now,
+        now.saturating_add(REJECT_TTL_MS),
+    )
+    .ok()?;
+    let mut frame = SwarmFrame {
+        version: SWARM_FRAME_VERSION,
+        frame_id: String::new(),
+        kind: SwarmFrameKind::Reject,
+        issuer: service_ref.clone(),
+        audience: json!({
+            "actorRef": source_frame.issuer,
+            "serviceRef": service_ref,
+        }),
+        zone_scope: source_frame.zone_scope.clone(),
+        issued_at: now,
+        expires_at: Some(now.saturating_add(REJECT_TTL_MS)),
+        nonce: format!("storage-reject-{now}-{}", source_frame.frame_id),
+        correlation_id: Some(source_frame.frame_id.clone()),
+        channel_id: source_frame.channel_id.clone(),
+        record_ref: None,
+        capability: None,
+        body: SwarmFrameBody {
+            encoding: "caac".to_string(),
+            envelope: Some(serde_json::to_value(envelope).ok()?),
+            public_bootstrap: false,
+            payload: None,
+            signature: None,
+        },
+        ack: Some(SwarmAck {
+            acked_frame_id: None,
+            retry_after_ms: None,
+            gap_after_frame_ids: vec![],
+            reason_code: Some(reason_code.to_string()),
+        }),
+    };
+    frame.frame_id = swarm_frame_id(&frame).ok()?;
+    validate_swarm_frame(&frame, now).ok()?;
+    Some(frame)
+}
+
+fn response_recipients(state: &ApiState, issuer: Option<&str>) -> Vec<String> {
+    let mut recipients = Vec::new();
+    if let Some(issuer) = issuer {
+        push_recipient(&mut recipients, issuer.trim());
+        if let Some((_, suffix)) = issuer.rsplit_once(':') {
+            push_recipient(&mut recipients, suffix.trim());
+        }
+    }
+    if recipients.is_empty() {
+        push_recipient(&mut recipients, state.service_identity.service_pk.trim());
+    }
+    recipients
+}
+
+fn push_recipient(recipients: &mut Vec<String>, value: &str) {
+    if is_hex_pubkey(value) && !recipients.iter().any(|item| item == value) {
+        recipients.push(value.to_string());
+    }
+}
+
+fn is_hex_pubkey(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use constitute_protocol::{SwarmRecordRef, pubkey_from_sk_hex};
+
+    use crate::engine::StorageEngine;
+    use crate::identity::StorageServiceIdentity;
+
+    const STORAGE_TEST_SK: &str =
+        "1111111111111111111111111111111111111111111111111111111111111111";
+    const ISSUER_TEST_SK: &str = "2222222222222222222222222222222222222222222222222222222222222222";
+
+    fn test_state() -> (tempfile::TempDir, ApiState) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let service_pk = pubkey_from_sk_hex(STORAGE_TEST_SK).expect("service pk");
+        let engine = StorageEngine::open(dir.path()).expect("engine");
+        (
+            dir,
+            ApiState {
+                engine,
+                service_identity: StorageServiceIdentity {
+                    service_pk,
+                    service_sk_hex: STORAGE_TEST_SK.to_string(),
+                },
+                caac_fixture_mode: true,
+            },
+        )
+    }
+
+    fn storage_edge_frame(nonce: &str) -> SwarmFrame {
+        let now = 1_700_000_000_000;
+        let issuer_pk = pubkey_from_sk_hex(ISSUER_TEST_SK).expect("issuer pk");
+        let mut frame = SwarmFrame {
+            version: SWARM_FRAME_VERSION,
+            frame_id: String::new(),
+            kind: SwarmFrameKind::StoragePinIntent,
+            issuer: issuer_pk,
+            audience: json!({ "service": "storage" }),
+            zone_scope: Some(ZoneScope {
+                zone_id: "zone_lab".to_string(),
+                privacy: Some("rawIds".to_string()),
+                ttl: Some(30),
+                max_hops: Some(2),
+            }),
+            issued_at: now,
+            expires_at: Some(now + 60_000),
+            nonce: nonce.to_string(),
+            correlation_id: Some(format!("corr-{nonce}")),
+            channel_id: Some("storage.pin.intent".to_string()),
+            record_ref: Some(SwarmRecordRef {
+                kind: "storage.pin.intent".to_string(),
+                id: "intent-edge-1".to_string(),
+                revision: Some(1),
+            }),
+            capability: Some("storage.pin".to_string()),
+            body: SwarmFrameBody {
+                encoding: "caac".to_string(),
+                envelope: Some(json!({
+                    "envelopeId": format!("env-{nonce}"),
+                })),
+                public_bootstrap: false,
+                payload: None,
+                signature: None,
+            },
+            ack: None,
+        };
+        frame.frame_id = swarm_frame_id(&frame).expect("frame id");
+        frame
+    }
+
+    #[test]
+    fn storage_edge_client_builds_valid_hello_wire_record() {
+        let service_pk = pubkey_from_sk_hex(&"1".repeat(64)).expect("service pk");
+        let config = default_config(
+            "ws://127.0.0.1:7000/swarm.edge".to_string(),
+            "zone_lab".to_string(),
+            service_pk.clone(),
+            "1".repeat(64),
+        );
+        let hello = build_hello(&config, 1_700_000_000_000);
+
+        validate_hello(&hello).expect("valid hello");
+        assert_eq!(hello.member_kind, "service");
+        assert_eq!(hello.member_ref, service_pk);
+        assert!(
+            hello
+                .supported_versions
+                .contains(&(SWARM_FRAME_VERSION as u32))
+        );
+        assert!(
+            hello
+                .capability_refs
+                .contains(&CAPABILITY_SWARM_EDGE_ATTACH.to_string())
+        );
+        assert!(
+            hello
+                .channel_refs
+                .contains(&"storage.pin.intent".to_string())
+        );
+        assert!(
+            hello
+                .promise_refs
+                .contains(&format!("service:storage:{service_pk}"))
+        );
+        assert!(hello.promise_refs.contains(&service_pk));
+
+        let wire =
+            serde_json::to_value(ServiceWireMessage::Hello { hello: &hello }).expect("wire json");
+        assert_eq!(wire_kind(&wire), Some(HELLO_WIRE_KIND));
+    }
+
+    #[test]
+    fn storage_edge_client_tracks_ack_and_reject_frames() {
+        let mut state = SwarmEdgeClientState::default();
+        let ack = SwarmFrame {
+            version: SWARM_FRAME_VERSION,
+            frame_id: "ack-frame".to_string(),
+            kind: SwarmFrameKind::Ack,
+            issuer: "gateway".to_string(),
+            audience: json!({}),
+            zone_scope: None,
+            issued_at: 1_700_000_000_000,
+            expires_at: None,
+            nonce: "ack-nonce".to_string(),
+            correlation_id: Some("sent-frame".to_string()),
+            channel_id: None,
+            record_ref: None,
+            capability: None,
+            body: SwarmFrameBody {
+                encoding: "caac".to_string(),
+                envelope: Some(json!({ "envelopeId": "ack" })),
+                public_bootstrap: false,
+                payload: None,
+                signature: None,
+            },
+            ack: Some(SwarmAck {
+                acked_frame_id: Some("sent-frame".to_string()),
+                retry_after_ms: None,
+                gap_after_frame_ids: vec![],
+                reason_code: None,
+            }),
+        };
+        assert!(handle_ack_reject(&mut state, &ack));
+        assert_eq!(state.last_acked_frame_id.as_deref(), Some("sent-frame"));
+
+        let mut reject = ack;
+        reject.kind = SwarmFrameKind::Reject;
+        reject.ack.as_mut().expect("ack").acked_frame_id = None;
+        reject.ack.as_mut().expect("ack").reason_code = Some("invalid_frame".to_string());
+        assert!(handle_ack_reject(&mut state, &reject));
+        assert_eq!(state.rejects, vec!["invalid_frame".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn storage_edge_reader_rejects_when_work_queue_is_saturated() {
+        let (_dir, state) = test_state();
+        let mut client_state = SwarmEdgeClientState::default();
+        let (frame_tx, mut frame_rx) = mpsc::channel::<(SwarmFrame, u64)>(1);
+        let (out_tx, mut out_rx) = mpsc::channel::<SwarmFrame>(1);
+        frame_tx
+            .try_send((storage_edge_frame("queued-frame"), 1_700_000_000_000))
+            .expect("fill work queue");
+
+        admit_storage_gateway_frame(
+            &state,
+            &mut client_state,
+            storage_edge_frame("overflow-frame"),
+            1_700_000_000_001,
+            &frame_tx,
+            &out_tx,
+        );
+
+        let reject = out_rx.try_recv().expect("reject response");
+        assert_eq!(reject.kind, SwarmFrameKind::Reject);
+        assert_eq!(
+            reject
+                .ack
+                .as_ref()
+                .and_then(|ack| ack.reason_code.as_deref()),
+            Some("storage_edge_overloaded")
+        );
+        assert_eq!(
+            frame_rx.try_recv().expect("queued frame").0.nonce,
+            "queued-frame"
+        );
+        assert!(frame_rx.try_recv().is_err());
+    }
+}
