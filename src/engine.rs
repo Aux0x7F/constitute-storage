@@ -1167,7 +1167,11 @@ mod tests {
             .collect();
         assert!(blocker_codes.iter().any(|code| code == "witness.missing"));
         assert!(blocker_codes.iter().any(|code| code == "validity.active"));
-        assert!(blocker_codes.iter().any(|code| code == "releaseAfter.pending"));
+        assert!(
+            blocker_codes
+                .iter()
+                .any(|code| code == "releaseAfter.pending")
+        );
         let pruned = engine
             .prune(PruneRequest {
                 now: 1_700_000_011,
@@ -1296,6 +1300,54 @@ mod tests {
                 "storage-member-raw-2".to_string()
             ]
         );
+    }
+
+    #[test]
+    fn app_distribution_pin_intent_uses_storage_projection_backing() {
+        let dir = tempdir().expect("tempdir");
+        let engine = StorageEngine::open(dir.path()).expect("engine");
+        let intent = StoragePinIntent {
+            intent_id: "intent-surface-app-release".to_string(),
+            object_refs: vec!["storage:object:surface-app:nvr-ui@0.2.0".to_string()],
+            manifest_hash: "sha256:surface-app-manifest:nvr-ui:0.2.0".to_string(),
+            desired_replicas: 1,
+            retention: "app-release".to_string(),
+            authority_refs: vec!["authority:app:nvr-ui".to_string()],
+            expires_at: Some(1_700_000_100_000),
+        };
+        let pending = engine.put_pin_intent(intent).expect("put app pin intent");
+        assert_eq!(
+            pending.projection.status,
+            StoragePinProjectionStatus::Pending
+        );
+        assert_eq!(pending.projection.missing_replicas, 1);
+
+        let satisfied = engine
+            .put_pin_attestation(
+                StoragePinAttestation {
+                    attestation_id: "attestation-surface-app-release".to_string(),
+                    intent_id: "intent-surface-app-release".to_string(),
+                    storage_member_ref: "storage-member-surface-app".to_string(),
+                    accepted_refs: vec!["storage:object:surface-app:nvr-ui@0.2.0".to_string()],
+                    availability_refs: vec![SwarmStorageAvailabilityRef {
+                        availability_id: "availability-surface-app-release".to_string(),
+                        object_ref: "storage:object:surface-app:nvr-ui@0.2.0".to_string(),
+                        storage_member_ref: "storage-member-surface-app".to_string(),
+                        expires_at: Some(1_700_000_100_000),
+                    }],
+                    status: StoragePinStatus::Pinned,
+                    expires_at: Some(1_700_000_100_000),
+                    issued_at: 1_700_000_000_000,
+                },
+                1_700_000_000_000,
+            )
+            .expect("app distribution attestation");
+        assert_eq!(
+            satisfied.projection.status,
+            StoragePinProjectionStatus::Satisfied
+        );
+        assert_eq!(satisfied.projection.pinned_count, 1);
+        assert_eq!(satisfied.projection.missing_replicas, 0);
     }
 
     #[test]

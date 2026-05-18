@@ -23,15 +23,17 @@ use crate::types::{
 };
 
 pub(crate) const STORAGE_MEMBER_REF: &str = "service:storage:local";
-pub(crate) const STORAGE_CHANNELS: [&str; 3] = [
+pub(crate) const STORAGE_CHANNELS: [&str; 4] = [
     "storage.pin.intent",
     "storage.pin.attestation",
     "storage.availability",
+    "surface.app.distribution",
 ];
-pub(crate) const STORAGE_EDGE_CAPABILITIES: [&str; 5] = [
+pub(crate) const STORAGE_EDGE_CAPABILITIES: [&str; 6] = [
     "storage.object.put",
     "storage.object.get",
     "storage.pin",
+    "surface.app.distribution.pin",
     "storage.availability.attest",
     "storage.local_search.query",
 ];
@@ -141,6 +143,11 @@ async fn hosted_service_manifest(State(state): State<ApiState>) -> impl IntoResp
                 "channelId": "storage.availability",
                 "recordKinds": ["storage.pin.projection", "storage.availability.ref"],
                 "capabilities": ["storage.object.get", "storage.local_search.query"]
+            },
+            {
+                "channelId": "surface.app.distribution",
+                "recordKinds": ["surface.app.manifest", "storage.pin.intent", "storage.pin.projection"],
+                "capabilities": ["surface.app.distribution.pin", "storage.pin", "storage.object.get"]
             }
         ],
         "swarmEdge": {
