@@ -789,6 +789,29 @@ fn storage_retention_release_posture(
 ) -> Result<RetentionReleasePosture> {
     let effective_retention = normalize_storage_retention_class(&request.retention_class);
     let mut blockers = Vec::new();
+    if let Some(valid_until) = request.valid_until {
+        if valid_until > now
+            && request.supersession_refs.is_empty()
+            && request.retraction_refs.is_empty()
+            && request.revocation_refs.is_empty()
+        {
+            blockers.push(serde_json::json!({
+                "code": "validity.active",
+                "validUntil": valid_until,
+            }));
+        }
+    }
+    if let Some(release_after) = request.release_after {
+        if release_after > now {
+            blockers.push(serde_json::json!({
+                "code": "releaseAfter.pending",
+                "releaseAfter": release_after,
+            }));
+        }
+    }
+    if request.require_witness && request.witness_refs.is_empty() {
+        blockers.push(serde_json::json!({ "code": "witness.missing" }));
+    }
     if active_pins > 0 {
         blockers.push(serde_json::json!({
             "code": "activePin",
@@ -806,6 +829,8 @@ fn storage_retention_release_posture(
     {
         blockers.push(serde_json::json!({ "code": "fulfillment.missing" }));
     }
+    let default_policy_ref = format!("policy:storage.retention.{effective_retention}");
+    let policy_refs = normalized_refs(&request.policy_refs, &[default_policy_ref.as_str()]);
     let posture = RetentionReleasePosture {
         kind: Some(RECORD_RETENTION_RELEASE.to_string()),
         evaluation_id: format!("storage-prune:{chunk_hash}:{now}"),
@@ -816,11 +841,19 @@ fn storage_retention_release_posture(
         } else {
             "releaseBlocked".to_string()
         },
+        policy_refs,
+        overlay_refs: normalized_refs(&request.overlay_refs, &["overlay:none"]),
         owner_refs: normalized_refs(&request.owner_refs, &["storage:local"]),
         holder_refs: normalized_refs(&request.holder_refs, &["storage:local"]),
         fulfillment_refs: normalized_refs(&request.fulfillment_refs, &[]),
         residency_layers: normalized_refs(&request.residency_layers, &["storageLocalBlob"]),
+        witness_refs: normalized_refs(&request.witness_refs, &[]),
+        supersession_refs: normalized_refs(&request.supersession_refs, &[]),
+        retraction_refs: normalized_refs(&request.retraction_refs, &[]),
+        revocation_refs: normalized_refs(&request.revocation_refs, &[]),
         blockers,
+        valid_until: request.valid_until,
+        release_after: request.release_after,
         evaluated_at: now,
     };
     validate_retention_release_posture(&posture)?;
@@ -1113,12 +1146,38 @@ mod tests {
             blocked.release_postures[0].blockers[0]["code"],
             "fulfillment.missing"
         );
+        let witness_blocked = engine
+            .prune(PruneRequest {
+                now: 1_700_000_001,
+                dry_run: true,
+                retention_class: "durable".to_string(),
+                fulfillment_refs: vec!["storage-fulfillment:replica-2".to_string()],
+                require_witness: true,
+                valid_until: Some(1_700_000_010),
+                release_after: Some(1_700_000_010),
+                ..Default::default()
+            })
+            .expect("witness blocked durable prune");
+        assert_eq!(witness_blocked.pruned_chunks, 0);
+        assert_eq!(witness_blocked.blocked_chunks, 1);
+        let blocker_codes: Vec<String> = witness_blocked.release_postures[0]
+            .blockers
+            .iter()
+            .filter_map(|blocker| blocker["code"].as_str().map(ToOwned::to_owned))
+            .collect();
+        assert!(blocker_codes.iter().any(|code| code == "witness.missing"));
+        assert!(blocker_codes.iter().any(|code| code == "validity.active"));
+        assert!(blocker_codes.iter().any(|code| code == "releaseAfter.pending"));
         let pruned = engine
             .prune(PruneRequest {
+                now: 1_700_000_011,
                 dry_run: false,
                 retention_class: "durable".to_string(),
                 fulfillment_refs: vec!["storage-fulfillment:replica-2".to_string()],
                 owner_refs: vec!["identity:operator".to_string()],
+                witness_refs: vec!["witness:storage-release-observed".to_string()],
+                valid_until: Some(1_700_000_010),
+                release_after: Some(1_700_000_010),
                 ..Default::default()
             })
             .expect("fulfilled durable prune");
@@ -1128,6 +1187,14 @@ mod tests {
         assert_eq!(
             pruned.release_postures[0].fulfillment_refs,
             vec!["storage-fulfillment:replica-2".to_string()]
+        );
+        assert_eq!(
+            pruned.release_postures[0].policy_refs,
+            vec!["policy:storage.retention.durable".to_string()]
+        );
+        assert_eq!(
+            pruned.release_postures[0].witness_refs,
+            vec!["witness:storage-release-observed".to_string()]
         );
     }
 

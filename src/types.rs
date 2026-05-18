@@ -101,6 +101,10 @@ pub struct PruneRequest {
     #[serde(default)]
     pub max_bytes: Option<u64>,
     #[serde(default)]
+    pub policy_refs: Vec<String>,
+    #[serde(default)]
+    pub overlay_refs: Vec<String>,
+    #[serde(default)]
     pub owner_refs: Vec<String>,
     #[serde(default)]
     pub holder_refs: Vec<String>,
@@ -108,6 +112,20 @@ pub struct PruneRequest {
     pub fulfillment_refs: Vec<String>,
     #[serde(default)]
     pub residency_layers: Vec<String>,
+    #[serde(default)]
+    pub witness_refs: Vec<String>,
+    #[serde(default)]
+    pub supersession_refs: Vec<String>,
+    #[serde(default)]
+    pub retraction_refs: Vec<String>,
+    #[serde(default)]
+    pub revocation_refs: Vec<String>,
+    #[serde(default)]
+    pub require_witness: bool,
+    #[serde(default)]
+    pub valid_until: Option<u64>,
+    #[serde(default)]
+    pub release_after: Option<u64>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
