@@ -603,6 +603,12 @@ async fn materialize_index(
     }
     Ok(Json(json!({
         "status": "materialized",
+        "materializationBudgetRef": "materialization:storage:local-index:operator",
+        "consumerFloorRef": "consumer-floor:storage:local-index:operator",
+        "retentionPosture": {
+            "state": "indexed",
+            "retentionClass": "operator-local-index"
+        },
         "entries": count,
         "pinIntents": pin_intents
     })))
