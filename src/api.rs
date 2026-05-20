@@ -1,3 +1,4 @@
+// domain-owned-vocabulary: storage.availability
 use axum::extract::ws::{Message, WebSocket};
 use axum::extract::{Path, Query, State, WebSocketUpgrade};
 use axum::http::StatusCode;
@@ -24,18 +25,18 @@ use crate::types::{
 
 pub(crate) const STORAGE_MEMBER_REF: &str = "service:storage:local";
 pub(crate) const STORAGE_CHANNELS: [&str; 4] = [
-    "storage.pin.intent",
-    "storage.pin.attestation",
+    constitute_protocol::RECORD_STORAGE_PIN_INTENT,
+    constitute_protocol::RECORD_STORAGE_PIN_ATTESTATION,
     "storage.availability",
-    "surface.app.distribution",
+    constitute_protocol::RECORD_SURFACE_APP_DISTRIBUTION,
 ];
 pub(crate) const STORAGE_EDGE_CAPABILITIES: [&str; 6] = [
-    "storage.object.put",
-    "storage.object.get",
-    "storage.pin",
-    "surface.app.distribution.pin",
-    "storage.availability.attest",
-    "storage.local_search.query",
+    constitute_protocol::CAPABILITY_STORAGE_OBJECT_PUT,
+    constitute_protocol::CAPABILITY_STORAGE_OBJECT_GET,
+    constitute_protocol::CAPABILITY_STORAGE_PIN,
+    constitute_protocol::CAPABILITY_SURFACE_APP_DISTRIBUTION_PIN,
+    constitute_protocol::CAPABILITY_STORAGE_AVAILABILITY_ATTEST,
+    constitute_protocol::CAPABILITY_STORAGE_LOCAL_SEARCH_QUERY,
 ];
 
 #[derive(Clone)]
@@ -135,24 +136,24 @@ async fn hosted_service_manifest(State(state): State<ApiState>) -> impl IntoResp
         "capabilities": STORAGE_EDGE_CAPABILITIES,
         "channels": [
             {
-                "channelId": "storage.pin.intent",
-                "recordKinds": ["storage.pin.intent"],
-                "capabilities": ["storage.pin"]
+                "channelId": constitute_protocol::RECORD_STORAGE_PIN_INTENT,
+                "recordKinds": [constitute_protocol::RECORD_STORAGE_PIN_INTENT],
+                "capabilities": [constitute_protocol::CAPABILITY_STORAGE_PIN]
             },
             {
-                "channelId": "storage.pin.attestation",
-                "recordKinds": ["storage.pin.attestation", "storage.availability.ref"],
-                "capabilities": ["storage.availability.attest"]
+                "channelId": constitute_protocol::RECORD_STORAGE_PIN_ATTESTATION,
+                "recordKinds": [constitute_protocol::RECORD_STORAGE_PIN_ATTESTATION, constitute_protocol::RECORD_STORAGE_AVAILABILITY_REF],
+                "capabilities": [constitute_protocol::CAPABILITY_STORAGE_AVAILABILITY_ATTEST]
             },
             {
                 "channelId": "storage.availability",
-                "recordKinds": ["storage.pin.projection", "storage.availability.ref"],
-                "capabilities": ["storage.object.get", "storage.local_search.query"]
+                "recordKinds": [constitute_protocol::RECORD_STORAGE_PIN_PROJECTION, constitute_protocol::RECORD_STORAGE_AVAILABILITY_REF],
+                "capabilities": [constitute_protocol::CAPABILITY_STORAGE_OBJECT_GET, constitute_protocol::CAPABILITY_STORAGE_LOCAL_SEARCH_QUERY]
             },
             {
-                "channelId": "surface.app.distribution",
-                "recordKinds": ["surface.app.manifest", "storage.pin.intent", "storage.pin.projection"],
-                "capabilities": ["surface.app.distribution.pin", "storage.pin", "storage.object.get"]
+                "channelId": constitute_protocol::RECORD_SURFACE_APP_DISTRIBUTION,
+                "recordKinds": [constitute_protocol::RECORD_SURFACE_APP_MANIFEST, constitute_protocol::RECORD_STORAGE_PIN_INTENT, constitute_protocol::RECORD_STORAGE_PIN_PROJECTION],
+                "capabilities": [constitute_protocol::CAPABILITY_SURFACE_APP_DISTRIBUTION_PIN, constitute_protocol::CAPABILITY_STORAGE_PIN, constitute_protocol::CAPABILITY_STORAGE_OBJECT_GET]
             }
         ],
         "swarmEdge": {
@@ -192,11 +193,11 @@ fn consume_edge_frame(state: &ApiState, frame: SwarmFrame, now: u64) -> Result<V
         .unwrap_or_default();
     match (&frame.kind, record_kind) {
         (SwarmFrameKind::StoragePinIntent, _)
-        | (SwarmFrameKind::RecordPublish, "storage.pin.intent") => {
+        | (SwarmFrameKind::RecordPublish, constitute_protocol::RECORD_STORAGE_PIN_INTENT) => {
             consume_pin_intent_frame(state, &frame, now)
         }
         (SwarmFrameKind::StoragePinAttestation, _)
-        | (SwarmFrameKind::RecordPublish, "storage.pin.attestation") => {
+        | (SwarmFrameKind::RecordPublish, constitute_protocol::RECORD_STORAGE_PIN_ATTESTATION) => {
             consume_pin_attestation_frame(state, &frame, now)
         }
         _ => Err(anyhow::anyhow!("storage edge frame record kind is unsupported").into()),
@@ -215,7 +216,7 @@ pub fn process_gateway_frame(
         || source_frame
             .record_ref
             .as_ref()
-            .is_some_and(|record| record.kind == "storage.pin.intent");
+            .is_some_and(|record| record.kind == constitute_protocol::RECORD_STORAGE_PIN_INTENT);
     if input_is_pin_intent
         && let Some(attestation) = response
             .get("attestation")
@@ -255,10 +256,10 @@ fn attestation_response_frame(
         service_identity,
         source_frame,
         SwarmFrameKind::StoragePinAttestation,
-        "storage.pin.attestation",
+        constitute_protocol::RECORD_STORAGE_PIN_ATTESTATION,
         &attestation_id,
-        "storage.pin.attestation",
-        "storage.availability.attest",
+        constitute_protocol::RECORD_STORAGE_PIN_ATTESTATION,
+        constitute_protocol::CAPABILITY_STORAGE_AVAILABILITY_ATTEST,
         attestation,
         now,
     );
@@ -283,7 +284,7 @@ fn projection_response_frame(
         SwarmFrameKind::ProjectionDelta,
         "storage.availability",
         &projection_id,
-        "storage.pin.projection",
+        constitute_protocol::RECORD_STORAGE_PIN_PROJECTION,
         CAPABILITY_PROJECTION_DELTA_APPLY,
         projection,
         now,
@@ -374,9 +375,9 @@ fn consume_pin_intent_frame(
         "projection": attestation_response.projection,
         "emittedRecords": [
             {
-                "recordKind": "storage.pin.attestation",
+                "recordKind": constitute_protocol::RECORD_STORAGE_PIN_ATTESTATION,
                 "recordId": attestation.attestation_id,
-                "channelId": "storage.pin.attestation"
+                "channelId": constitute_protocol::RECORD_STORAGE_PIN_ATTESTATION
             }
         ]
     }))
@@ -788,7 +789,7 @@ mod tests {
                 id: record_id.to_string(),
                 revision: Some(1),
             }),
-            capability: Some("storage.pin".to_string()),
+            capability: Some(constitute_protocol::CAPABILITY_STORAGE_PIN.to_string()),
             body: SwarmFrameBody {
                 encoding: "caac".to_string(),
                 envelope: Some(json!({
@@ -849,7 +850,7 @@ mod tests {
                 id: record_id.to_string(),
                 revision: Some(1),
             }),
-            capability: Some("storage.pin".to_string()),
+            capability: Some(constitute_protocol::CAPABILITY_STORAGE_PIN.to_string()),
             body: SwarmFrameBody {
                 encoding: "caac".to_string(),
                 envelope: Some(serde_json::to_value(envelope).expect("envelope json")),
@@ -871,8 +872,8 @@ mod tests {
         let intent = pin_intent(1);
         let frame = storage_edge_frame(
             SwarmFrameKind::StoragePinIntent,
-            "storage.pin.intent",
-            "storage.pin.intent",
+            constitute_protocol::RECORD_STORAGE_PIN_INTENT,
+            constitute_protocol::RECORD_STORAGE_PIN_INTENT,
             &intent.intent_id,
             serde_json::to_value(&intent).expect("intent json"),
             "nonce-storage-pin-intent",
@@ -887,7 +888,7 @@ mod tests {
         assert_eq!(response["projection"]["status"], "satisfied");
         assert_eq!(
             response["emittedRecords"][0]["recordKind"],
-            "storage.pin.attestation"
+            constitute_protocol::RECORD_STORAGE_PIN_ATTESTATION
         );
     }
 
@@ -899,8 +900,8 @@ mod tests {
         let intent = pin_intent(1);
         let frame = storage_edge_frame(
             SwarmFrameKind::StoragePinIntent,
-            "storage.pin.intent",
-            "storage.pin.intent",
+            constitute_protocol::RECORD_STORAGE_PIN_INTENT,
+            constitute_protocol::RECORD_STORAGE_PIN_INTENT,
             &intent.intent_id,
             serde_json::to_value(&intent).expect("intent json"),
             "nonce-storage-stream-pin-intent",
@@ -933,8 +934,8 @@ mod tests {
         let attestation = pin_attestation("attestation-edge");
         let frame = storage_edge_frame(
             SwarmFrameKind::StoragePinAttestation,
-            "storage.pin.attestation",
-            "storage.pin.attestation",
+            constitute_protocol::RECORD_STORAGE_PIN_ATTESTATION,
+            constitute_protocol::RECORD_STORAGE_PIN_ATTESTATION,
             &attestation.attestation_id,
             serde_json::to_value(&attestation).expect("attestation json"),
             "nonce-storage-pin-attestation",
@@ -1017,8 +1018,8 @@ mod tests {
         let intent = pin_intent(1);
         let frame = storage_edge_frame(
             SwarmFrameKind::StoragePinIntent,
-            "storage.pin.intent",
-            "storage.pin.intent",
+            constitute_protocol::RECORD_STORAGE_PIN_INTENT,
+            constitute_protocol::RECORD_STORAGE_PIN_INTENT,
             &intent.intent_id,
             serde_json::to_value(&intent).expect("intent json"),
             "nonce-placeholder-rejected",
@@ -1037,8 +1038,8 @@ mod tests {
         let intent = pin_intent(1);
         let frame = product_storage_edge_frame(
             SwarmFrameKind::StoragePinIntent,
-            "storage.pin.intent",
-            "storage.pin.intent",
+            constitute_protocol::RECORD_STORAGE_PIN_INTENT,
+            constitute_protocol::RECORD_STORAGE_PIN_INTENT,
             &intent.intent_id,
             serde_json::to_value(&intent).expect("intent json"),
             "nonce-real-caac-pin-intent",

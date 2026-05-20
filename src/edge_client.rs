@@ -1,3 +1,4 @@
+// domain-owned-vocabulary: storage.edge.reject swarm.edge.claims
 use anyhow::{Context, Result};
 use constitute_protocol::{
     CAPABILITY_SWARM_EDGE_ATTACH, SWARM_EDGE_WIRE_ACCEPT, SWARM_EDGE_WIRE_HELLO,
@@ -621,13 +622,13 @@ mod tests {
             expires_at: Some(now + 60_000),
             nonce: nonce.to_string(),
             correlation_id: Some(format!("corr-{nonce}")),
-            channel_id: Some("storage.pin.intent".to_string()),
+            channel_id: Some(constitute_protocol::RECORD_STORAGE_PIN_INTENT.to_string()),
             record_ref: Some(SwarmRecordRef {
-                kind: "storage.pin.intent".to_string(),
+                kind: constitute_protocol::RECORD_STORAGE_PIN_INTENT.to_string(),
                 id: "intent-edge-1".to_string(),
                 revision: Some(1),
             }),
-            capability: Some("storage.pin".to_string()),
+            capability: Some(constitute_protocol::CAPABILITY_STORAGE_PIN.to_string()),
             body: SwarmFrameBody {
                 encoding: "caac".to_string(),
                 envelope: Some(json!({
@@ -670,7 +671,7 @@ mod tests {
         assert!(
             hello
                 .channel_refs
-                .contains(&"storage.pin.intent".to_string())
+                .contains(&constitute_protocol::RECORD_STORAGE_PIN_INTENT.to_string())
         );
         assert!(
             hello
