@@ -9,13 +9,16 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as B64;
 use constitute_protocol::{
     RECORD_RETENTION_RELEASE, RECORD_STORAGE_BACKEND_POSTURE, RECORD_STORAGE_BACKEND_SNAPSHOT,
-    RetentionReleasePosture, STORAGE_BACKEND_KIND_LOCAL_FS_SQLITE, STORAGE_BACKEND_STATE_DEGRADED,
-    STORAGE_BACKEND_STATE_READY, StorageBackendPosture, StorageBackendSnapshot, StorageKeyGrant,
-    StorageObjectManifest, StoragePinAttestation, StoragePinIntent, StoragePinLease,
-    StoragePinProjection, storage_pin_projection_from_intent, storage_pin_projection_from_records,
+    RECORD_STORAGE_FILESYSTEM_VIEW, RetentionReleasePosture, STORAGE_BACKEND_KIND_LOCAL_FS_SQLITE,
+    STORAGE_BACKEND_STATE_DEGRADED, STORAGE_BACKEND_STATE_READY, STORAGE_FILESYSTEM_VIEW_DEGRADED,
+    STORAGE_FILESYSTEM_VIEW_READY, StorageBackendPosture, StorageBackendSnapshot,
+    StorageFilesystemEntry, StorageFilesystemView, StorageKeyGrant, StorageObjectManifest,
+    StoragePinAttestation, StoragePinIntent, StoragePinLease, StoragePinProjection,
+    storage_pin_projection_from_intent, storage_pin_projection_from_records,
     validate_retention_release_posture, validate_storage_backend_posture,
-    validate_storage_backend_snapshot, validate_storage_chunk_ref, validate_storage_index_shard,
-    validate_storage_manifest, validate_storage_pin_attestation, validate_storage_pin_intent,
+    validate_storage_backend_snapshot, validate_storage_chunk_ref,
+    validate_storage_filesystem_view, validate_storage_index_shard, validate_storage_manifest,
+    validate_storage_pin_attestation, validate_storage_pin_intent,
 };
 use rusqlite::{Connection, OptionalExtension, params};
 use tokio::sync::broadcast;
@@ -201,6 +204,118 @@ impl StorageEngine {
         };
         validate_storage_backend_snapshot(&snapshot)?;
         Ok(snapshot)
+    }
+
+    pub fn filesystem_view(
+        &self,
+        storage_member_ref: impl AsRef<str>,
+        limit: usize,
+        captured_at: u64,
+    ) -> Result<StorageFilesystemView> {
+        let captured_at = if captured_at == 0 {
+            now_seconds()
+        } else {
+            captured_at
+        };
+        let capped_at = if limit == 0 { 64 } else { limit.min(512) };
+        let posture = self.backend_posture(storage_member_ref.as_ref(), captured_at)?;
+        let db = self.lock_db()?;
+        let mut entries = Vec::new();
+        let mut object_stmt = db.prepare(
+            "select o.object_id, o.container_id, o.manifest_json, o.logical_deleted_at, coalesce(sum(c.size), 0) \
+             from objects o \
+             left join object_chunks oc on oc.object_id = o.object_id \
+             left join chunks c on c.hash = oc.chunk_hash \
+             group by o.object_id, o.container_id, o.manifest_json, o.logical_deleted_at, o.last_accessed_at \
+             order by o.last_accessed_at desc, o.object_id asc \
+             limit ?1",
+        )?;
+        let object_rows = object_stmt.query_map(params![capped_at as i64], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<u64>>(3)?,
+                row.get::<_, u64>(4)?,
+            ))
+        })?;
+        for row in object_rows {
+            let (object_id, container_id, manifest_json, logical_deleted_at, size) = row?;
+            let manifest: StorageObjectManifest = serde_json::from_str(&manifest_json)?;
+            entries.push(StorageFilesystemEntry {
+                entry_ref: format!("storage-filesystem-entry:object:{object_id}"),
+                path: format!(
+                    "objects/{}/{}.manifest.json",
+                    storage_virtual_component(&container_id),
+                    storage_virtual_component(&object_id)
+                ),
+                object_ref: Some(format!("storage:object:{object_id}")),
+                chunk_ref: None,
+                media_type: if manifest.media_type.trim().is_empty() {
+                    "application/octet-stream".to_string()
+                } else {
+                    manifest.media_type
+                },
+                size,
+                logical_deleted_at,
+            });
+        }
+        let remaining = capped_at.saturating_sub(entries.len());
+        if remaining > 0 {
+            let mut chunk_stmt = db.prepare(
+                "select hash, size from chunks order by last_accessed_at desc, hash asc limit ?1",
+            )?;
+            let chunk_rows = chunk_stmt.query_map(params![remaining as i64], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, u64>(1)?))
+            })?;
+            for row in chunk_rows {
+                let (hash, size) = row?;
+                let prefix = hash.get(0..2).unwrap_or("xx");
+                entries.push(StorageFilesystemEntry {
+                    entry_ref: format!("storage-filesystem-entry:chunk:{hash}"),
+                    path: format!(
+                        "chunks/{}/{}.bin",
+                        storage_virtual_component(prefix),
+                        storage_virtual_component(&hash)
+                    ),
+                    object_ref: None,
+                    chunk_ref: Some(format!("storage:chunk:{hash}")),
+                    media_type: "application/octet-stream".to_string(),
+                    size,
+                    logical_deleted_at: None,
+                });
+            }
+        }
+
+        let state = if posture.state == STORAGE_BACKEND_STATE_READY {
+            STORAGE_FILESYSTEM_VIEW_READY
+        } else {
+            STORAGE_FILESYSTEM_VIEW_DEGRADED
+        };
+        let view = StorageFilesystemView {
+            kind: Some(RECORD_STORAGE_FILESYSTEM_VIEW.to_string()),
+            view_id: format!("storage-filesystem-view:local:{captured_at}"),
+            backend_id: posture.backend_id,
+            storage_member_ref: posture.storage_member_ref,
+            root_ref: posture.root_ref,
+            state: state.to_string(),
+            view_mode: "virtualReadOnly".to_string(),
+            materialization_ref: "materialization:storage:filesystem-view:local".to_string(),
+            object_count: posture.object_count,
+            chunk_count: posture.chunk_count,
+            entry_count: entries.len() as u64,
+            entries,
+            capped_at: capped_at as u64,
+            evidence_refs: vec![
+                "storage:backend:snapshot".to_string(),
+                "storage:filesystem-view:virtual".to_string(),
+            ],
+            blocked_reasons: posture.blocked_reasons,
+            captured_at,
+            expires_at: Some(captured_at + 60),
+        };
+        validate_storage_filesystem_view(&view)?;
+        Ok(view)
     }
 
     pub fn put_object(&self, request: PutObjectRequest) -> Result<StoredObjectResponse> {
@@ -916,6 +1031,18 @@ fn load_prefixed_refs(
     Ok(refs)
 }
 
+fn storage_virtual_component(value: &str) -> String {
+    let mut out = String::new();
+    for ch in value.chars() {
+        if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
+            out.push(ch);
+        } else {
+            out.push('_');
+        }
+    }
+    if out.is_empty() { "_".to_string() } else { out }
+}
+
 fn load_pin_intent(conn: &Connection, intent_id: &str) -> Result<Option<StoragePinIntent>> {
     let intent_json: Option<String> = conn
         .query_row(
@@ -1425,6 +1552,39 @@ mod tests {
                 .iter()
                 .any(|item| item == "storage:pin-intent:intent-1")
         );
+    }
+
+    #[test]
+    fn filesystem_view_materializes_virtual_paths_without_local_leakage() {
+        let dir = tempdir().expect("tempdir");
+        let engine = StorageEngine::open(dir.path()).expect("engine");
+        let chunk = chunk(b"filesystem-view-ciphertext");
+        let manifest = manifest("container-a", "container-a:key", &chunk);
+        engine
+            .put_object(PutObjectRequest {
+                manifest: manifest.clone(),
+                chunks: vec![chunk],
+            })
+            .expect("put object");
+
+        let view = engine
+            .filesystem_view("service:storage:local", 8, 1_700_000_001)
+            .expect("filesystem view");
+
+        assert_eq!(view.state, STORAGE_FILESYSTEM_VIEW_READY);
+        assert_eq!(view.object_count, 1);
+        assert_eq!(view.chunk_count, 1);
+        let object_ref = format!("storage:object:{}", manifest.object_id);
+        assert!(
+            view.entries
+                .iter()
+                .any(|entry| entry.object_ref.as_deref() == Some(object_ref.as_str()))
+        );
+        assert!(view.entries.iter().any(|entry| entry.chunk_ref.is_some()));
+        let serialized = serde_json::to_string(&view).expect("view json");
+        assert!(!serialized.contains(dir.path().to_string_lossy().as_ref()));
+        assert!(!serialized.contains("\\"));
+        assert!(!serialized.contains("../"));
     }
 
     fn pin_intent() -> StoragePinIntent {

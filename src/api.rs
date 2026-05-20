@@ -113,6 +113,10 @@ pub fn router(engine: StorageEngine, service_identity: StorageServiceIdentity) -
         )
         .route("/operator/storage/v1/snapshot", get(get_backend_snapshot))
         .route(
+            "/operator/storage/v1/filesystem-view",
+            get(get_filesystem_view),
+        )
+        .route(
             "/operator/storage/v1/local-index/materialize",
             post(materialize_index),
         )
@@ -175,6 +179,7 @@ async fn hosted_service_manifest(State(state): State<ApiState>) -> impl IntoResp
             "pinProjections": "/operator/storage/v1/pin-projections/{intentId}",
             "backendPosture": "/operator/storage/v1/backend-posture",
             "snapshot": "/operator/storage/v1/snapshot",
+            "filesystemView": "/operator/storage/v1/filesystem-view",
             "watch": "/operator/storage/v1/watch"
         }
     }))
@@ -635,6 +640,18 @@ async fn get_backend_snapshot(
     )?))
 }
 
+async fn get_filesystem_view(
+    State(state): State<ApiState>,
+    Query(query): Query<BackendSnapshotQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    let member_ref = format!("service:storage:{}", state.service_identity.service_pk);
+    Ok(Json(state.engine.filesystem_view(
+        member_ref,
+        query.limit.unwrap_or(64),
+        query.now.unwrap_or_else(crate::engine::now_seconds),
+    )?))
+}
+
 async fn materialize_index(
     State(state): State<ApiState>,
     Json(request): Json<MaterializeIndexRequest>,
@@ -1008,6 +1025,25 @@ mod tests {
             .await
             .expect("response");
         assert_eq!(snapshot.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn operator_filesystem_view_is_explicit_storage_materialization() {
+        let dir = tempdir().expect("tempdir");
+        let engine = StorageEngine::open(dir.path()).expect("engine");
+        let app = router(engine, test_identity());
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/operator/storage/v1/filesystem-view?now=1700000000&limit=4")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[test]
