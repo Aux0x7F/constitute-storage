@@ -6,6 +6,11 @@ It handles content-addressed objects, encrypted chunks, encrypted indexes, pin
 leases, availability, grants, pruning, and storage projections for services that
 need durable backing and redundancy.
 
+The current engine is local filesystem blobs plus SQLite metadata. Operator
+routes expose backend posture and bounded snapshots for counts, bytes, pins,
+leases, attestations, materialized entries, and missing chunk detection without
+leaking local filesystem paths.
+
 Logging may reference encrypted event details through storage pin intents, but
 Storage remains the fulfillment substrate. It does not own event grammar,
 correlation, query semantics, or detection policy.

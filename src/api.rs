@@ -107,6 +107,11 @@ pub fn router(engine: StorageEngine, service_identity: StorageServiceIdentity) -
         .route("/operator/storage/v1/pins", post(put_pin))
         .route("/operator/storage/v1/pins/{pin_id}", delete(retract_pin))
         .route(
+            "/operator/storage/v1/backend-posture",
+            get(get_backend_posture),
+        )
+        .route("/operator/storage/v1/snapshot", get(get_backend_snapshot))
+        .route(
             "/operator/storage/v1/local-index/materialize",
             post(materialize_index),
         )
@@ -167,6 +172,8 @@ async fn hosted_service_manifest(State(state): State<ApiState>) -> impl IntoResp
             "pinIntents": "/operator/storage/v1/pin-intents",
             "pinAttestations": "/operator/storage/v1/pin-attestations",
             "pinProjections": "/operator/storage/v1/pin-projections/{intentId}",
+            "backendPosture": "/operator/storage/v1/backend-posture",
+            "snapshot": "/operator/storage/v1/snapshot",
             "watch": "/operator/storage/v1/watch"
         }
     }))
@@ -591,6 +598,42 @@ async fn prune(
     Ok(Json(state.engine.prune(request)?))
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BackendPostureQuery {
+    now: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BackendSnapshotQuery {
+    now: Option<u64>,
+    limit: Option<usize>,
+}
+
+async fn get_backend_posture(
+    State(state): State<ApiState>,
+    Query(query): Query<BackendPostureQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    let member_ref = format!("service:storage:{}", state.service_identity.service_pk);
+    Ok(Json(state.engine.backend_posture(
+        member_ref,
+        query.now.unwrap_or_else(crate::engine::now_seconds),
+    )?))
+}
+
+async fn get_backend_snapshot(
+    State(state): State<ApiState>,
+    Query(query): Query<BackendSnapshotQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    let member_ref = format!("service:storage:{}", state.service_identity.service_pk);
+    Ok(Json(state.engine.backend_snapshot(
+        member_ref,
+        query.limit.unwrap_or(64),
+        query.now.unwrap_or_else(crate::engine::now_seconds),
+    )?))
+}
+
 async fn materialize_index(
     State(state): State<ApiState>,
     Json(request): Json<MaterializeIndexRequest>,
@@ -931,6 +974,39 @@ mod tests {
                 .expect("response");
             assert_eq!(response.status(), StatusCode::NOT_FOUND, "{method} {path}");
         }
+    }
+
+    #[tokio::test]
+    async fn operator_backend_posture_and_snapshot_are_explicit_storage_views() {
+        let dir = tempdir().expect("tempdir");
+        let engine = StorageEngine::open(dir.path()).expect("engine");
+        engine.put_pin_intent(pin_intent(1)).expect("put intent");
+        let app = router(engine, test_identity());
+
+        let posture = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/operator/storage/v1/backend-posture?now=1700000000")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(posture.status(), StatusCode::OK);
+
+        let snapshot = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/operator/storage/v1/snapshot?now=1700000000&limit=4")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(snapshot.status(), StatusCode::OK);
     }
 
     #[test]

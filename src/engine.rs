@@ -7,10 +7,13 @@ use anyhow::{Context, Result, anyhow};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as B64;
 use constitute_protocol::{
-    RECORD_RETENTION_RELEASE, RetentionReleasePosture, StorageKeyGrant, StorageObjectManifest,
-    StoragePinAttestation, StoragePinIntent, StoragePinLease, StoragePinProjection,
-    storage_pin_projection_from_intent, storage_pin_projection_from_records,
-    validate_retention_release_posture, validate_storage_chunk_ref, validate_storage_index_shard,
+    RECORD_RETENTION_RELEASE, RECORD_STORAGE_BACKEND_POSTURE, RECORD_STORAGE_BACKEND_SNAPSHOT,
+    RetentionReleasePosture, STORAGE_BACKEND_KIND_LOCAL_FS_SQLITE, STORAGE_BACKEND_STATE_DEGRADED,
+    STORAGE_BACKEND_STATE_READY, StorageBackendPosture, StorageBackendSnapshot, StorageKeyGrant,
+    StorageObjectManifest, StoragePinAttestation, StoragePinIntent, StoragePinLease,
+    StoragePinProjection, storage_pin_projection_from_intent, storage_pin_projection_from_records,
+    validate_retention_release_posture, validate_storage_backend_posture,
+    validate_storage_backend_snapshot, validate_storage_chunk_ref, validate_storage_index_shard,
     validate_storage_manifest, validate_storage_pin_attestation, validate_storage_pin_intent,
 };
 use rusqlite::{Connection, OptionalExtension, params};
@@ -76,6 +79,127 @@ impl StorageEngine {
             pin_attestations: count_table(&db, "pin_attestations")?,
             materialized_entries: count_table(&db, "materialized_entries")?,
         })
+    }
+
+    pub fn backend_posture(
+        &self,
+        storage_member_ref: impl AsRef<str>,
+        sampled_at: u64,
+    ) -> Result<StorageBackendPosture> {
+        let sampled_at = if sampled_at == 0 {
+            now_seconds()
+        } else {
+            sampled_at
+        };
+        let db = self.lock_db()?;
+        let missing_chunk_count = count_missing_chunk_files(&db)?;
+        let state = if missing_chunk_count == 0 {
+            STORAGE_BACKEND_STATE_READY
+        } else {
+            STORAGE_BACKEND_STATE_DEGRADED
+        };
+        let blocked_reasons = if missing_chunk_count == 0 {
+            Vec::new()
+        } else {
+            vec![format!("storage.chunk.missing:{missing_chunk_count}")]
+        };
+        let posture = StorageBackendPosture {
+            kind: Some(RECORD_STORAGE_BACKEND_POSTURE.to_string()),
+            posture_id: format!("storage-backend-posture:local:{sampled_at}"),
+            backend_id: "storage-backend:local".to_string(),
+            storage_member_ref: storage_member_ref.as_ref().to_string(),
+            backend_kind: STORAGE_BACKEND_KIND_LOCAL_FS_SQLITE.to_string(),
+            state: state.to_string(),
+            root_ref: "storage-root:local".to_string(),
+            object_count: count_table(&db, "objects")?,
+            chunk_count: count_table(&db, "chunks")?,
+            stored_bytes: sum_chunk_bytes(&db)?,
+            index_shard_count: count_table(&db, "index_shards")?,
+            key_grant_count: count_table(&db, "key_grants")?,
+            pin_lease_count: count_table(&db, "pin_leases")?,
+            pin_intent_count: count_table(&db, "pin_intents")?,
+            pin_attestation_count: count_table(&db, "pin_attestations")?,
+            materialized_entry_count: count_table(&db, "materialized_entries")?,
+            logical_deleted_object_count: count_where(
+                &db,
+                "objects",
+                "logical_deleted_at is not null",
+            )?,
+            missing_chunk_count,
+            evidence_refs: vec![
+                "storage:sqlite:local".to_string(),
+                "storage:blob-dir:local".to_string(),
+            ],
+            blocked_reasons,
+            sampled_at,
+            expires_at: Some(sampled_at + 60),
+        };
+        validate_storage_backend_posture(&posture)?;
+        Ok(posture)
+    }
+
+    pub fn backend_snapshot(
+        &self,
+        storage_member_ref: impl AsRef<str>,
+        limit: usize,
+        captured_at: u64,
+    ) -> Result<StorageBackendSnapshot> {
+        let captured_at = if captured_at == 0 {
+            now_seconds()
+        } else {
+            captured_at
+        };
+        let capped_at = if limit == 0 { 64 } else { limit.min(512) };
+        let posture = self.backend_posture(storage_member_ref.as_ref(), captured_at)?;
+        let db = self.lock_db()?;
+        let snapshot = StorageBackendSnapshot {
+            kind: Some(RECORD_STORAGE_BACKEND_SNAPSHOT.to_string()),
+            snapshot_id: format!("storage-backend-snapshot:local:{captured_at}"),
+            backend_id: posture.backend_id.clone(),
+            storage_member_ref: posture.storage_member_ref.clone(),
+            posture_ref: posture.posture_id,
+            object_count: posture.object_count,
+            chunk_count: posture.chunk_count,
+            pin_lease_count: posture.pin_lease_count,
+            pin_intent_count: posture.pin_intent_count,
+            pin_attestation_count: posture.pin_attestation_count,
+            materialized_entry_count: posture.materialized_entry_count,
+            object_refs: load_prefixed_refs(
+                &db,
+                "select object_id from objects order by created_at desc, object_id asc limit ?1",
+                "storage:object:",
+                capped_at,
+            )?,
+            chunk_refs: load_prefixed_refs(
+                &db,
+                "select hash from chunks order by last_accessed_at desc, hash asc limit ?1",
+                "storage:chunk:",
+                capped_at,
+            )?,
+            pin_lease_refs: load_prefixed_refs(
+                &db,
+                "select pin_id from pin_leases order by created_at desc, pin_id asc limit ?1",
+                "storage:pin-lease:",
+                capped_at,
+            )?,
+            pin_intent_refs: load_prefixed_refs(
+                &db,
+                "select intent_id from pin_intents order by created_at desc, intent_id asc limit ?1",
+                "storage:pin-intent:",
+                capped_at,
+            )?,
+            pin_projection_refs: load_prefixed_refs(
+                &db,
+                "select intent_id from pin_intents order by created_at desc, intent_id asc limit ?1",
+                "storage:pin-projection:",
+                capped_at,
+            )?,
+            capped_at: capped_at as u64,
+            captured_at,
+            expires_at: Some(captured_at + 60),
+        };
+        validate_storage_backend_snapshot(&snapshot)?;
+        Ok(snapshot)
     }
 
     pub fn put_object(&self, request: PutObjectRequest) -> Result<StoredObjectResponse> {
@@ -750,6 +874,47 @@ fn count_table(conn: &Connection, table: &str) -> Result<u64> {
     Ok(count as u64)
 }
 
+fn count_where(conn: &Connection, table: &str, predicate: &str) -> Result<u64> {
+    let sql = format!("select count(*) from {table} where {predicate}");
+    let count: i64 = conn.query_row(&sql, [], |row| row.get(0))?;
+    Ok(count as u64)
+}
+
+fn sum_chunk_bytes(conn: &Connection) -> Result<u64> {
+    let total: i64 = conn.query_row("select coalesce(sum(size), 0) from chunks", [], |row| {
+        row.get(0)
+    })?;
+    Ok(total as u64)
+}
+
+fn count_missing_chunk_files(conn: &Connection) -> Result<u64> {
+    let mut stmt = conn.prepare("select path from chunks")?;
+    let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+    let mut missing = 0u64;
+    for row in rows {
+        let path = row?;
+        if fs::metadata(path).is_err() {
+            missing += 1;
+        }
+    }
+    Ok(missing)
+}
+
+fn load_prefixed_refs(
+    conn: &Connection,
+    sql: &str,
+    prefix: &str,
+    limit: usize,
+) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare(sql)?;
+    let rows = stmt.query_map(params![limit as i64], |row| row.get::<_, String>(0))?;
+    let mut refs = Vec::new();
+    for row in rows {
+        refs.push(format!("{prefix}{}", row?));
+    }
+    Ok(refs)
+}
+
 fn load_pin_intent(conn: &Connection, intent_id: &str) -> Result<Option<StoragePinIntent>> {
     let intent_json: Option<String> = conn
         .query_row(
@@ -1199,6 +1364,65 @@ mod tests {
         assert_eq!(
             pruned.release_postures[0].witness_refs,
             vec!["witness:storage-release-observed".to_string()]
+        );
+    }
+
+    #[test]
+    fn backend_posture_and_snapshot_do_not_expose_local_paths() {
+        let dir = tempdir().expect("tempdir");
+        let engine = StorageEngine::open(dir.path()).expect("engine");
+        let chunk = chunk(b"snapshot-ciphertext");
+        let manifest = manifest("container-a", "container-a:key", &chunk);
+        engine
+            .put_object(PutObjectRequest {
+                manifest: manifest.clone(),
+                chunks: vec![chunk],
+            })
+            .expect("put object");
+        engine
+            .put_pin(StoragePinLease {
+                pin_id: "pin-snapshot".to_string(),
+                container_id: "container-a".to_string(),
+                object_id: Some(manifest.object_id.clone()),
+                chunk_hash: None,
+                pinned_by: "owner".to_string(),
+                retention_class: "proof".to_string(),
+                created_at: 1,
+                expires_at: None,
+                last_accessed_at: None,
+            })
+            .expect("pin");
+        engine.put_pin_intent(pin_intent()).expect("put intent");
+
+        let posture = engine
+            .backend_posture("service:storage:local", 1_700_000_001)
+            .expect("backend posture");
+        assert_eq!(posture.state, STORAGE_BACKEND_STATE_READY);
+        assert_eq!(posture.object_count, 1);
+        assert_eq!(posture.chunk_count, 1);
+        assert_eq!(posture.root_ref, "storage-root:local");
+        assert!(
+            !serde_json::to_string(&posture)
+                .expect("json")
+                .contains(dir.path().to_string_lossy().as_ref())
+        );
+
+        let snapshot = engine
+            .backend_snapshot("service:storage:local", 8, 1_700_000_001)
+            .expect("backend snapshot");
+        assert_eq!(snapshot.object_count, 1);
+        assert_eq!(snapshot.pin_lease_count, 1);
+        assert!(
+            snapshot
+                .object_refs
+                .iter()
+                .any(|item| item.starts_with("storage:object:"))
+        );
+        assert!(
+            snapshot
+                .pin_intent_refs
+                .iter()
+                .any(|item| item == "storage:pin-intent:intent-1")
         );
     }
 
