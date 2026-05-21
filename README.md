@@ -8,8 +8,8 @@ need durable backing and redundancy.
 
 The current engine is local filesystem blobs plus SQLite metadata. Operator
 routes expose backend posture and bounded snapshots for counts, bytes, pins,
-leases, attestations, materialized entries, and missing chunk detection without
-leaking local filesystem paths.
+leases, attestations, queryable graph edges, materialized entries, and missing
+chunk detection without leaking local filesystem paths.
 
 The filesystem-facing surface is a virtual materialization view over storage
 refs. It exposes safe relative paths for future mount/FUSE adapters and does
@@ -37,4 +37,5 @@ Operator views:
 curl.exe http://127.0.0.1:7478/operator/storage/v1/backend-posture
 curl.exe http://127.0.0.1:7478/operator/storage/v1/snapshot
 curl.exe http://127.0.0.1:7478/operator/storage/v1/filesystem-view
+curl.exe http://127.0.0.1:7478/operator/storage/v1/graph-edges
 ```

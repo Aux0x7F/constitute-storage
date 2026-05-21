@@ -1,7 +1,7 @@
 use constitute_protocol::{
-    EncryptedDetailRef, RetentionReleasePosture, StorageChunkRef, StorageIndexShard,
-    StorageKeyGrant, StorageObjectManifest, StoragePinAttestation, StoragePinIntent,
-    StoragePinLease, StoragePinProjection,
+    EncryptedDetailRef, RetentionReleasePosture, StorageChunkRef, StorageGraphEdge,
+    StorageIndexShard, StorageKeyGrant, StorageObjectManifest, StoragePinAttestation,
+    StoragePinIntent, StoragePinLease, StoragePinProjection,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -47,6 +47,18 @@ pub struct PutIndexShardRequest {
 pub struct StoredIndexShardResponse {
     pub shard: StorageIndexShard,
     pub stored_chunk_count: usize,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PutGraphEdgeRequest {
+    pub edge: StorageGraphEdge,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GraphEdgeSearchResponse {
+    pub edges: Vec<StorageGraphEdge>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -181,6 +193,7 @@ pub struct StorageHealth {
     pub objects: u64,
     pub chunks: u64,
     pub index_shards: u64,
+    pub graph_edges: u64,
     pub key_grants: u64,
     pub pin_leases: u64,
     pub pin_intents: u64,
