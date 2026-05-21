@@ -19,8 +19,9 @@ use tower_http::trace::TraceLayer;
 use crate::engine::StorageEngine;
 use crate::identity::StorageServiceIdentity;
 use crate::types::{
-    MaterializeIndexRequest, PruneRequest, PutIndexShardRequest, PutKeyGrantRequest,
-    PutObjectRequest, PutPinAttestationRequest, PutPinIntentRequest, PutPinRequest,
+    MaterializeIndexRequest, PruneRequest, PutGraphEdgeRequest, PutIndexShardRequest,
+    PutKeyGrantRequest, PutObjectRequest, PutPinAttestationRequest, PutPinIntentRequest,
+    PutPinRequest,
 };
 
 pub(crate) const STORAGE_MEMBER_REF: &str = "service:storage:local";
@@ -75,6 +76,16 @@ struct SearchQuery {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct GraphQuery {
+    container_id: Option<String>,
+    from_ref: Option<String>,
+    relation: Option<String>,
+    to_ref: Option<String>,
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct ProjectionQuery {
     now: Option<u64>,
 }
@@ -121,6 +132,10 @@ pub fn router(engine: StorageEngine, service_identity: StorageServiceIdentity) -
             post(materialize_index),
         )
         .route("/operator/storage/v1/local-index/search", get(search))
+        .route(
+            "/operator/storage/v1/graph-edges",
+            get(get_graph_edges).post(put_graph_edge),
+        )
         .route("/operator/storage/v1/watch", get(watch))
         .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http())
@@ -180,6 +195,7 @@ async fn hosted_service_manifest(State(state): State<ApiState>) -> impl IntoResp
             "backendPosture": "/operator/storage/v1/backend-posture",
             "snapshot": "/operator/storage/v1/snapshot",
             "filesystemView": "/operator/storage/v1/filesystem-view",
+            "graphEdges": "/operator/storage/v1/graph-edges",
             "watch": "/operator/storage/v1/watch"
         }
     }))
@@ -687,6 +703,26 @@ async fn search(
     )?))
 }
 
+async fn put_graph_edge(
+    State(state): State<ApiState>,
+    Json(request): Json<PutGraphEdgeRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    Ok(Json(state.engine.put_graph_edge(request.edge)?))
+}
+
+async fn get_graph_edges(
+    State(state): State<ApiState>,
+    Query(query): Query<GraphQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    Ok(Json(state.engine.graph_edges(
+        query.container_id.as_deref(),
+        query.from_ref.as_deref(),
+        query.relation.as_deref(),
+        query.to_ref.as_deref(),
+        query.limit.unwrap_or(64),
+    )?))
+}
+
 async fn watch(State(state): State<ApiState>, ws: WebSocketUpgrade) -> impl IntoResponse {
     ws.on_upgrade(move |socket| watch_socket(socket, state.engine))
 }
@@ -712,8 +748,9 @@ mod tests {
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
     use constitute_protocol::{
-        SWARM_FRAME_VERSION, StoragePinAttestation, StoragePinIntent, StoragePinStatus,
-        SwarmFrameBody, SwarmRecordRef, ZoneScope, pubkey_from_sk_hex, swarm_frame_id,
+        SWARM_FRAME_VERSION, StorageGraphEdge, StoragePinAttestation, StoragePinIntent,
+        StoragePinStatus, SwarmFrameBody, SwarmRecordRef, ZoneScope, pubkey_from_sk_hex,
+        swarm_frame_id,
     };
     use tempfile::tempdir;
     use tower::ServiceExt;
@@ -1038,6 +1075,50 @@ mod tests {
                 Request::builder()
                     .method("GET")
                     .uri("/operator/storage/v1/filesystem-view?now=1700000000&limit=4")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn operator_graph_edges_are_explicit_storage_view() {
+        let dir = tempdir().expect("tempdir");
+        let engine = StorageEngine::open(dir.path()).expect("engine");
+        let app = router(engine, test_identity());
+        let edge = StorageGraphEdge {
+            edge_id: "edge-api-source-object".to_string(),
+            container_id: "container-source".to_string(),
+            from_ref: "source:snapshot:1".to_string(),
+            relation: "stores".to_string(),
+            to_ref: "storage:object:source-pack-1".to_string(),
+            detail_ref: None,
+            created_at: 1_700_000_001,
+        };
+
+        let create = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/operator/storage/v1/graph-edges")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({ "edge": edge })).expect("edge json"),
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(create.status(), StatusCode::OK);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/operator/storage/v1/graph-edges?containerId=container-source&fromRef=source:snapshot:1&relation=stores")
                     .body(Body::empty())
                     .expect("request"),
             )

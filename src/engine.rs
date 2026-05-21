@@ -12,9 +12,9 @@ use constitute_protocol::{
     RECORD_STORAGE_FILESYSTEM_VIEW, RetentionReleasePosture, STORAGE_BACKEND_KIND_LOCAL_FS_SQLITE,
     STORAGE_BACKEND_STATE_DEGRADED, STORAGE_BACKEND_STATE_READY, STORAGE_FILESYSTEM_VIEW_DEGRADED,
     STORAGE_FILESYSTEM_VIEW_READY, StorageBackendPosture, StorageBackendSnapshot,
-    StorageFilesystemEntry, StorageFilesystemView, StorageKeyGrant, StorageObjectManifest,
-    StoragePinAttestation, StoragePinIntent, StoragePinLease, StoragePinProjection,
-    storage_pin_projection_from_intent, storage_pin_projection_from_records,
+    StorageFilesystemEntry, StorageFilesystemView, StorageGraphEdge, StorageKeyGrant,
+    StorageObjectManifest, StoragePinAttestation, StoragePinIntent, StoragePinLease,
+    StoragePinProjection, storage_pin_projection_from_intent, storage_pin_projection_from_records,
     validate_retention_release_posture, validate_storage_backend_posture,
     validate_storage_backend_snapshot, validate_storage_chunk_ref,
     validate_storage_filesystem_view, validate_storage_index_shard, validate_storage_manifest,
@@ -25,8 +25,8 @@ use tokio::sync::broadcast;
 use uuid::Uuid;
 
 use crate::types::{
-    GetObjectResponse, MaterializedIndexEntry, PruneRequest, PruneResponse, PutChunk,
-    PutIndexShardRequest, PutObjectRequest, SearchResponse, StorageHealth,
+    GetObjectResponse, GraphEdgeSearchResponse, MaterializedIndexEntry, PruneRequest,
+    PruneResponse, PutChunk, PutIndexShardRequest, PutObjectRequest, SearchResponse, StorageHealth,
     StoragePinAttestationResponse, StoragePinIntentResponse, StorageWatchEvent,
     StoredIndexShardResponse, StoredObjectResponse,
 };
@@ -77,6 +77,7 @@ impl StorageEngine {
             objects: count_table(&db, "objects")?,
             chunks: count_table(&db, "chunks")?,
             index_shards: count_table(&db, "index_shards")?,
+            graph_edges: count_table(&db, "graph_edges")?,
             key_grants: count_table(&db, "key_grants")?,
             pin_leases: count_table(&db, "pin_leases")?,
             pin_intents: count_table(&db, "pin_intents")?,
@@ -463,6 +464,9 @@ impl StorageEngine {
                 request.shard.created_at
             ],
         )?;
+        for edge in &request.shard.graph_edges {
+            insert_graph_edge(&tx, edge)?;
+        }
         tx.commit()?;
         self.emit(
             "index_shard.stored",
@@ -475,6 +479,52 @@ impl StorageEngine {
             shard: request.shard,
             stored_chunk_count: stored,
         })
+    }
+
+    pub fn put_graph_edge(&self, edge: StorageGraphEdge) -> Result<StorageGraphEdge> {
+        validate_storage_graph_edge(&edge)?;
+        let db = self.lock_db()?;
+        insert_graph_edge(&db, &edge)?;
+        self.emit(
+            "graph_edge.stored",
+            "normal",
+            Some(&edge.container_id),
+            None,
+            "storage graph edge stored",
+        );
+        Ok(edge)
+    }
+
+    pub fn graph_edges(
+        &self,
+        container_id: Option<&str>,
+        from_ref: Option<&str>,
+        relation: Option<&str>,
+        to_ref: Option<&str>,
+        limit: usize,
+    ) -> Result<GraphEdgeSearchResponse> {
+        let capped_at = if limit == 0 { 64 } else { limit.min(512) };
+        let db = self.lock_db()?;
+        let mut stmt = db.prepare(
+            "select edge_json from graph_edges
+             where (?1 is null or container_id = ?1)
+               and (?2 is null or from_ref = ?2)
+               and (?3 is null or relation = ?3)
+               and (?4 is null or to_ref = ?4)
+             order by created_at desc, edge_id asc
+             limit ?5",
+        )?;
+        let rows = stmt.query_map(
+            params![container_id, from_ref, relation, to_ref, capped_at as i64],
+            |row| row.get::<_, String>(0),
+        )?;
+        let mut edges = Vec::new();
+        for row in rows {
+            let edge: StorageGraphEdge = serde_json::from_str(&row?)?;
+            validate_storage_graph_edge(&edge)?;
+            edges.push(edge);
+        }
+        Ok(GraphEdgeSearchResponse { edges })
     }
 
     pub fn put_key_grant(&self, grant: StorageKeyGrant) -> Result<StorageKeyGrant> {
@@ -914,6 +964,15 @@ fn init_schema(conn: &Connection) -> Result<()> {
             ordinal integer not null,
             primary key (shard_id, chunk_hash)
         );
+        create table if not exists graph_edges (
+            edge_id text primary key,
+            container_id text not null,
+            from_ref text not null,
+            relation text not null,
+            to_ref text not null,
+            edge_json text not null,
+            created_at integer not null
+        );
         create table if not exists key_grants (
             grant_id text primary key,
             container_id text not null,
@@ -988,6 +1047,52 @@ fn count_table(conn: &Connection, table: &str) -> Result<u64> {
     let sql = format!("select count(*) from {table}");
     let count: i64 = conn.query_row(&sql, [], |row| row.get(0))?;
     Ok(count as u64)
+}
+
+fn insert_graph_edge(conn: &Connection, edge: &StorageGraphEdge) -> Result<()> {
+    validate_storage_graph_edge(edge)?;
+    conn.execute(
+        "insert or replace into graph_edges (edge_id, container_id, from_ref, relation, to_ref, edge_json, created_at) values (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![
+            edge.edge_id,
+            edge.container_id,
+            edge.from_ref,
+            edge.relation,
+            edge.to_ref,
+            serde_json::to_string(edge)?,
+            edge.created_at
+        ],
+    )?;
+    Ok(())
+}
+
+fn validate_storage_graph_edge(edge: &StorageGraphEdge) -> Result<()> {
+    if edge.edge_id.trim().is_empty() {
+        return Err(anyhow!("storage graph edge missing edgeId"));
+    }
+    if edge.container_id.trim().is_empty() {
+        return Err(anyhow!("storage graph edge missing containerId"));
+    }
+    if edge.from_ref.trim().is_empty() {
+        return Err(anyhow!("storage graph edge missing fromRef"));
+    }
+    if edge.relation.trim().is_empty() {
+        return Err(anyhow!("storage graph edge missing relation"));
+    }
+    if edge.to_ref.trim().is_empty() {
+        return Err(anyhow!("storage graph edge missing toRef"));
+    }
+    if edge.created_at == 0 {
+        return Err(anyhow!("storage graph edge missing createdAt"));
+    }
+    if edge.from_ref.contains('\\')
+        || edge.from_ref.contains("../")
+        || edge.to_ref.contains('\\')
+        || edge.to_ref.contains("../")
+    {
+        return Err(anyhow!("storage graph edge refs must be virtual refs"));
+    }
+    Ok(())
 }
 
 fn count_where(conn: &Connection, table: &str, predicate: &str) -> Result<u64> {
@@ -1203,9 +1308,9 @@ pub fn now_millis() -> u64 {
 mod tests {
     use constitute_protocol::{
         STORAGE_CHUNK_HASH_ALG, STORAGE_ENCRYPTION_ALG_XCHACHA20POLY1305, STORAGE_OBJECT_HASH_ALG,
-        StorageChunkRef, StorageObjectManifest, StoragePinAttestation, StoragePinIntent,
-        StoragePinProjectionStatus, StoragePinStatus, SwarmStorageAvailabilityRef,
-        storage_chunk_id, storage_ciphertext_hash, storage_object_id,
+        StorageChunkRef, StorageGraphEdge, StorageObjectManifest, StoragePinAttestation,
+        StoragePinIntent, StoragePinProjectionStatus, StoragePinStatus,
+        SwarmStorageAvailabilityRef, storage_chunk_id, storage_ciphertext_hash, storage_object_id,
     };
     use tempfile::tempdir;
 
@@ -1585,6 +1690,47 @@ mod tests {
         assert!(!serialized.contains(dir.path().to_string_lossy().as_ref()));
         assert!(!serialized.contains("\\"));
         assert!(!serialized.contains("../"));
+    }
+
+    #[test]
+    fn graph_edges_are_queryable_without_source_semantics() {
+        let dir = tempdir().expect("tempdir");
+        let engine = StorageEngine::open(dir.path()).expect("engine");
+        let edge = StorageGraphEdge {
+            edge_id: "edge-source-tree-object".to_string(),
+            container_id: "container-source".to_string(),
+            from_ref: "source:tree:root".to_string(),
+            relation: "contains".to_string(),
+            to_ref: "storage:object:source-pack-1".to_string(),
+            detail_ref: None,
+            created_at: 1_700_000_001,
+        };
+
+        engine.put_graph_edge(edge.clone()).expect("put graph edge");
+        let by_from = engine
+            .graph_edges(
+                Some("container-source"),
+                Some("source:tree:root"),
+                Some("contains"),
+                None,
+                8,
+            )
+            .expect("query graph edges");
+
+        assert_eq!(by_from.edges, vec![edge]);
+        assert!(
+            engine
+                .graph_edges(
+                    Some("container-source"),
+                    Some("../local/path"),
+                    None,
+                    None,
+                    8,
+                )
+                .expect("query invalid-looking ref")
+                .edges
+                .is_empty()
+        );
     }
 
     fn pin_intent() -> StoragePinIntent {
