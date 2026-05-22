@@ -20,8 +20,8 @@ use constitute_protocol::{
     StoragePinProjection, storage_pin_projection_from_intent, storage_pin_projection_from_records,
     validate_retention_release_posture, validate_storage_backend_posture,
     validate_storage_backend_snapshot, validate_storage_chunk_ref,
-    validate_storage_filesystem_view, validate_storage_index_shard, validate_storage_manifest,
-    validate_storage_pin_attestation, validate_storage_pin_intent,
+    validate_storage_filesystem_view, validate_storage_graph_edge, validate_storage_index_shard,
+    validate_storage_manifest, validate_storage_pin_attestation, validate_storage_pin_intent,
 };
 use rusqlite::{Connection, OptionalExtension, params};
 use tokio::sync::broadcast;
@@ -1130,35 +1130,6 @@ fn insert_graph_edge(conn: &Connection, edge: &StorageGraphEdge) -> Result<()> {
             edge.created_at
         ],
     )?;
-    Ok(())
-}
-
-fn validate_storage_graph_edge(edge: &StorageGraphEdge) -> Result<()> {
-    if edge.edge_id.trim().is_empty() {
-        return Err(anyhow!("storage graph edge missing edgeId"));
-    }
-    if edge.container_id.trim().is_empty() {
-        return Err(anyhow!("storage graph edge missing containerId"));
-    }
-    if edge.from_ref.trim().is_empty() {
-        return Err(anyhow!("storage graph edge missing fromRef"));
-    }
-    if edge.relation.trim().is_empty() {
-        return Err(anyhow!("storage graph edge missing relation"));
-    }
-    if edge.to_ref.trim().is_empty() {
-        return Err(anyhow!("storage graph edge missing toRef"));
-    }
-    if edge.created_at == 0 {
-        return Err(anyhow!("storage graph edge missing createdAt"));
-    }
-    if edge.from_ref.contains('\\')
-        || edge.from_ref.contains("../")
-        || edge.to_ref.contains('\\')
-        || edge.to_ref.contains("../")
-    {
-        return Err(anyhow!("storage graph edge refs must be virtual refs"));
-    }
     Ok(())
 }
 
