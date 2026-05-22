@@ -1,4 +1,4 @@
-// domain-owned-vocabulary: storage.sqlite3
+// domain-owned-vocabulary: storage.sqlite3 sourceSnapshot.stores
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -17,7 +17,8 @@ use constitute_protocol::{
     STORAGE_FILESYSTEM_VIEW_READY, StorageBackendPosture, StorageBackendSnapshot,
     StorageFilesystemEntry, StorageFilesystemView, StorageGraphEdge, StorageKeyGrant,
     StorageObjectManifest, StoragePinAttestation, StoragePinIntent, StoragePinLease,
-    StoragePinProjection, storage_pin_projection_from_intent, storage_pin_projection_from_records,
+    StoragePinProjection, StoragePinStatus, SwarmStorageAvailabilityRef, sha256_hex,
+    storage_pin_projection_from_intent, storage_pin_projection_from_records,
     validate_retention_release_posture, validate_storage_backend_posture,
     validate_storage_backend_snapshot, validate_storage_chunk_ref,
     validate_storage_filesystem_view, validate_storage_graph_edge, validate_storage_index_shard,
@@ -29,10 +30,12 @@ use uuid::Uuid;
 
 use crate::types::{
     GetObjectResponse, GraphEdgeSearchResponse, MaterializedIndexEntry, PruneRequest,
-    PruneResponse, PutChunk, PutIndexShardRequest, PutObjectRequest, SearchResponse, StorageHealth,
-    StoragePinAttestationResponse, StoragePinIntentResponse, StorageWatchEvent,
-    StoredIndexShardResponse, StoredObjectResponse,
+    PruneResponse, PutChunk, PutIndexShardRequest, PutObjectRequest, PutSourceObjectRequest,
+    SearchResponse, SourceObjectStorageResponse, StorageHealth, StoragePinAttestationResponse,
+    StoragePinIntentResponse, StorageWatchEvent, StoredIndexShardResponse, StoredObjectResponse,
 };
+
+const RELATION_SOURCE_SNAPSHOT_STORES: &str = "sourceSnapshot.stores";
 
 #[derive(Clone)]
 pub struct StorageEngine {
@@ -438,6 +441,88 @@ impl StorageEngine {
         Ok(StoredObjectResponse {
             manifest: request.manifest,
             stored_chunk_count: stored,
+        })
+    }
+
+    pub fn put_source_object(
+        &self,
+        request: PutSourceObjectRequest,
+    ) -> Result<SourceObjectStorageResponse> {
+        validate_source_object_request(&request)?;
+        let now = if request.issued_at == 0 {
+            now_seconds()
+        } else {
+            request.issued_at
+        };
+        let object_ref = storage_object_ref(&request.manifest);
+        let object = self.put_object(PutObjectRequest {
+            manifest: request.manifest.clone(),
+            chunks: request.chunks,
+        })?;
+        let graph_edge = self.put_graph_edge(StorageGraphEdge {
+            edge_id: format!(
+                "storage:graph-edge:{}",
+                short_storage_id(&format!(
+                    "{}|{}|{}",
+                    request.source_snapshot_ref, object_ref, now
+                ))
+            ),
+            container_id: request.manifest.container_id.clone(),
+            from_ref: request.source_snapshot_ref.clone(),
+            relation: RELATION_SOURCE_SNAPSHOT_STORES.to_string(),
+            to_ref: object_ref.clone(),
+            detail_ref: None,
+            created_at: now,
+        })?;
+        let pin_intent = StoragePinIntent {
+            intent_id: format!(
+                "storage-pin-intent:{}",
+                short_storage_id(&format!(
+                    "{}|{}|{}",
+                    request.source_graph_ref, object_ref, now
+                ))
+            ),
+            object_refs: vec![object_ref.clone()],
+            manifest_hash: format!("storage:manifest:{}", request.manifest.content_hash),
+            desired_replicas: request.desired_replicas,
+            retention: request.retention,
+            authority_refs: request.authority_refs,
+            expires_at: request.expires_at,
+        };
+        let pin_intent = self.put_pin_intent(pin_intent)?;
+        let pin_attestation = StoragePinAttestation {
+            attestation_id: format!(
+                "storage-pin-attestation:{}",
+                short_storage_id(&format!(
+                    "{}|{}|{}",
+                    pin_intent.intent.intent_id, request.storage_member_ref, now
+                ))
+            ),
+            intent_id: pin_intent.intent.intent_id.clone(),
+            storage_member_ref: request.storage_member_ref.clone(),
+            accepted_refs: vec![object_ref.clone(), graph_edge.edge_id.clone()],
+            availability_refs: vec![SwarmStorageAvailabilityRef {
+                availability_id: format!(
+                    "storage-availability:{}",
+                    short_storage_id(&format!(
+                        "{}|{}|{}",
+                        object_ref, request.storage_member_ref, now
+                    ))
+                ),
+                object_ref,
+                storage_member_ref: request.storage_member_ref,
+                expires_at: request.expires_at,
+            }],
+            status: StoragePinStatus::Pinned,
+            expires_at: request.expires_at,
+            issued_at: now,
+        };
+        let pin_attestation = self.put_pin_attestation(pin_attestation, now)?;
+        Ok(SourceObjectStorageResponse {
+            object,
+            graph_edge,
+            pin_intent,
+            pin_attestation,
         })
     }
 
@@ -1186,6 +1271,69 @@ fn storage_virtual_component(value: &str) -> String {
     if out.is_empty() { "_".to_string() } else { out }
 }
 
+fn storage_object_ref(manifest: &StorageObjectManifest) -> String {
+    format!("storage:object:{}", manifest.object_id)
+}
+
+fn short_storage_id(value: &str) -> String {
+    sha256_hex(value).chars().take(16).collect()
+}
+
+fn validate_source_object_request(request: &PutSourceObjectRequest) -> Result<()> {
+    validate_virtual_ref(&request.source_graph_ref, "source object sourceGraphRef")?;
+    validate_virtual_ref(
+        &request.source_snapshot_ref,
+        "source object sourceSnapshotRef",
+    )?;
+    validate_virtual_ref(
+        &request.storage_member_ref,
+        "source object storageMemberRef",
+    )?;
+    validate_storage_manifest(&request.manifest)?;
+    if request.chunks.is_empty() {
+        return Err(anyhow!("source object put requires chunks"));
+    }
+    if request.authority_refs.is_empty() {
+        return Err(anyhow!("source object pin requires authorityRefs"));
+    }
+    if request.desired_replicas == 0 {
+        return Err(anyhow!("source object desiredReplicas must be positive"));
+    }
+    if request.issued_at == 0 {
+        return Err(anyhow!("source object missing issuedAt"));
+    }
+    if request
+        .expires_at
+        .is_some_and(|expires_at| expires_at <= request.issued_at)
+    {
+        return Err(anyhow!("source object expiresAt must be after issuedAt"));
+    }
+    validate_ref_slice(&request.authority_refs, "source object authorityRefs")
+}
+
+fn validate_ref_slice(refs: &[String], context: &str) -> Result<()> {
+    for value in refs {
+        validate_virtual_ref(value, context)?;
+    }
+    Ok(())
+}
+
+fn validate_virtual_ref(value: &str, context: &str) -> Result<()> {
+    if value.trim().is_empty() {
+        return Err(anyhow!("{context} missing ref"));
+    }
+    if value.chars().any(char::is_whitespace)
+        || value.contains('\\')
+        || value.starts_with('/')
+        || value.starts_with("file:")
+        || value.starts_with("http:")
+        || value.starts_with("https:")
+    {
+        return Err(anyhow!("{context} must be a virtual ref"));
+    }
+    Ok(())
+}
+
 fn load_pin_intent(conn: &Connection, intent_id: &str) -> Result<Option<StoragePinIntent>> {
     let intent_json: Option<String> = conn
         .query_row(
@@ -1404,6 +1552,68 @@ mod tests {
             .logical_delete_object(&manifest.object_id, 2)
             .expect("logical delete");
         assert!(engine.get_object(&manifest.object_id).is_err());
+    }
+
+    #[test]
+    fn source_object_put_stores_edges_and_pin_availability_without_source_semantics() {
+        let dir = tempdir().expect("tempdir");
+        let engine = StorageEngine::open(dir.path()).expect("engine");
+        let chunk = chunk(b"source-pack-ciphertext");
+        let manifest = manifest("storage:container:source-graph", "source:key:pack", &chunk);
+        let object_ref = format!("storage:object:{}", manifest.object_id);
+
+        let response = engine
+            .put_source_object(PutSourceObjectRequest {
+                source_graph_ref: "source:graph:constitute-git".to_string(),
+                source_snapshot_ref: "source:snapshot:head".to_string(),
+                storage_member_ref: "service:storage:local".to_string(),
+                manifest: manifest.clone(),
+                chunks: vec![chunk.clone()],
+                authority_refs: vec!["authority:source:graph".to_string()],
+                desired_replicas: 1,
+                retention: "source-object".to_string(),
+                expires_at: Some(1_700_000_100),
+                issued_at: 1_700_000_000,
+            })
+            .expect("put source object");
+
+        assert_eq!(response.object.manifest.object_id, manifest.object_id);
+        assert_eq!(response.graph_edge.from_ref, "source:snapshot:head");
+        assert_eq!(
+            response.graph_edge.relation,
+            RELATION_SOURCE_SNAPSHOT_STORES
+        );
+        assert_eq!(response.graph_edge.to_ref, object_ref);
+        assert_eq!(response.pin_intent.projection.missing_replicas, 1);
+        assert_eq!(
+            response.pin_attestation.projection.status,
+            StoragePinProjectionStatus::Satisfied
+        );
+        assert_eq!(response.pin_attestation.projection.pinned_count, 1);
+        assert_eq!(
+            response.pin_attestation.projection.availability[0].object_ref,
+            response.graph_edge.to_ref
+        );
+
+        let fetched = engine
+            .get_object(&manifest.object_id)
+            .expect("get source object");
+        assert_eq!(fetched.chunks[0].ciphertext_base64, chunk.ciphertext_base64);
+        let edges = engine
+            .graph_edges(
+                Some(&manifest.container_id),
+                Some("source:snapshot:head"),
+                Some(RELATION_SOURCE_SNAPSHOT_STORES),
+                None,
+                8,
+            )
+            .expect("source object graph edges");
+        assert_eq!(edges.edges, vec![response.graph_edge]);
+        let posture = engine
+            .backend_posture("service:storage:local", 1_700_000_001)
+            .expect("backend posture");
+        assert_eq!(posture.pin_intent_count, 1);
+        assert_eq!(posture.pin_attestation_count, 1);
     }
 
     #[test]
