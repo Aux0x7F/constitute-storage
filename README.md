@@ -11,6 +11,11 @@ routes expose backend posture and bounded snapshots for counts, bytes, pins,
 leases, attestations, queryable graph edges, materialized entries, and missing
 chunk detection without leaking local filesystem paths.
 
+The engine can also emit a host-fabric storage-journal/cache member
+contribution from backend posture and snapshot evidence. Fabric reduces that
+composition signal; Storage still owns byte retrieval, pin/cache fulfillment,
+and encrypted storage records.
+
 The filesystem-facing surface is a virtual materialization view over storage
 refs. It exposes safe relative paths for future mount/FUSE adapters and does
 not expose machine-local blob paths.

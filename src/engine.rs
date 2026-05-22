@@ -7,7 +7,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, anyhow};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as B64;
+use constitute_fabric::{HostFabricMemberContributionSpec, build_host_fabric_member_contribution};
 use constitute_protocol::{
+    FABRIC_MEMBER_CONTRIBUTION_DEGRADED, FABRIC_MEMBER_CONTRIBUTION_RUNNING,
+    FABRIC_MEMBER_ROLE_STORAGE_JOURNAL_CACHE, HostFabricMemberContribution,
     RECORD_RETENTION_RELEASE, RECORD_STORAGE_BACKEND_POSTURE, RECORD_STORAGE_BACKEND_SNAPSHOT,
     RECORD_STORAGE_FILESYSTEM_VIEW, RetentionReleasePosture, STORAGE_BACKEND_KIND_LOCAL_FS_SQLITE,
     STORAGE_BACKEND_STATE_DEGRADED, STORAGE_BACKEND_STATE_READY, STORAGE_FILESYSTEM_VIEW_DEGRADED,
@@ -205,6 +208,70 @@ impl StorageEngine {
         };
         validate_storage_backend_snapshot(&snapshot)?;
         Ok(snapshot)
+    }
+
+    pub fn host_fabric_storage_contribution(
+        &self,
+        storage_member_ref: impl AsRef<str>,
+        fabric_ref: impl AsRef<str>,
+        host_ref: impl AsRef<str>,
+        sampled_at: u64,
+    ) -> Result<HostFabricMemberContribution> {
+        let posture = self.backend_posture(storage_member_ref.as_ref(), sampled_at)?;
+        let snapshot =
+            self.backend_snapshot(storage_member_ref.as_ref(), 64, posture.sampled_at)?;
+        let running = posture.state == STORAGE_BACKEND_STATE_READY;
+        let contribution =
+            build_host_fabric_member_contribution(HostFabricMemberContributionSpec {
+                contribution_id: format!(
+                    "fabric-contribution:storage-journal-cache:{}",
+                    posture.sampled_at
+                ),
+                fabric_ref: fabric_ref.as_ref().to_string(),
+                host_ref: host_ref.as_ref().to_string(),
+                member_ref: posture.storage_member_ref.clone(),
+                role: FABRIC_MEMBER_ROLE_STORAGE_JOURNAL_CACHE.to_string(),
+                state: if running {
+                    FABRIC_MEMBER_CONTRIBUTION_RUNNING.to_string()
+                } else {
+                    FABRIC_MEMBER_CONTRIBUTION_DEGRADED.to_string()
+                },
+                contract_ref: posture.backend_id.clone(),
+                subject_ref: posture.backend_id.clone(),
+                capability_refs: vec![
+                    "capability:storage:journal".to_string(),
+                    "capability:storage:cache".to_string(),
+                    "capability:storage:pin".to_string(),
+                ],
+                grant_refs: Vec::new(),
+                input_refs: vec![posture.root_ref.clone()],
+                output_refs: vec![
+                    posture.posture_id.clone(),
+                    snapshot.snapshot_id.clone(),
+                    posture.backend_id.clone(),
+                ],
+                evidence_refs: posture.evidence_refs.clone(),
+                lifecycle_plan_refs: vec![format!(
+                    "lifecycle-plan:storage-journal-cache:{}",
+                    posture.backend_id.replace(':', "-")
+                )],
+                release_refs: Vec::new(),
+                resource_posture: None,
+                blocked_reasons: posture.blocked_reasons.clone(),
+                safe_facts: serde_json::json!({
+                    "backendKind": posture.backend_kind,
+                    "objectCount": posture.object_count,
+                    "chunkCount": posture.chunk_count,
+                    "pinLeaseCount": posture.pin_lease_count,
+                    "pinIntentCount": posture.pin_intent_count,
+                    "materializedEntryCount": posture.materialized_entry_count,
+                    "missingChunkCount": posture.missing_chunk_count
+                }),
+                observed_at: posture.sampled_at,
+                expires_at: posture.expires_at,
+            })?;
+        constitute_protocol::validate_host_fabric_member_contribution(&contribution)?;
+        Ok(contribution)
     }
 
     pub fn filesystem_view(
@@ -1451,6 +1518,42 @@ mod tests {
             found.entries[0].encrypted_detail_refs[0].object_id,
             "object-log-detail-2"
         );
+    }
+
+    #[test]
+    fn host_fabric_storage_contribution_reports_backend_posture() {
+        let dir = tempdir().expect("tempdir");
+        let engine = StorageEngine::open(dir.path()).expect("engine");
+        let chunk = chunk(b"ciphertext");
+        let manifest = manifest("container-a", "container-a:key", &chunk);
+        engine
+            .put_object(PutObjectRequest {
+                manifest,
+                chunks: vec![chunk],
+            })
+            .expect("put object");
+
+        let contribution = engine
+            .host_fabric_storage_contribution(
+                "4a29ff60c5c3837e9e20555bfeb2a046be3eb140818144628691fcf7efb1d2f1",
+                "fabric:runner-lab",
+                "host:runner-lab",
+                1_700_000_000,
+            )
+            .expect("contribution");
+
+        constitute_protocol::validate_host_fabric_member_contribution(&contribution)
+            .expect("valid contribution");
+        assert_eq!(
+            contribution.role,
+            constitute_protocol::FABRIC_MEMBER_ROLE_STORAGE_JOURNAL_CACHE
+        );
+        assert_eq!(
+            contribution.state,
+            constitute_protocol::FABRIC_MEMBER_CONTRIBUTION_RUNNING
+        );
+        assert_eq!(contribution.contract_ref, "storage-backend:local");
+        assert_eq!(contribution.safe_facts["objectCount"].as_u64(), Some(1));
     }
 
     #[test]
