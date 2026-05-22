@@ -20,6 +20,12 @@ The filesystem-facing surface is a virtual materialization view over storage
 refs. It exposes safe relative paths for future mount/FUSE adapters and does
 not expose machine-local blob paths.
 
+Source systems may store source object packs through a storage-owned adapter
+that writes the encrypted object, journals a source-snapshot-to-object graph
+edge, and derives pin availability posture. Storage proves bytes and
+availability; source graph, branch, release, and project semantics stay with
+the source/project contracts.
+
 Logging may reference encrypted event details through storage pin intents, but
 Storage remains the fulfillment substrate. It does not own event grammar,
 correlation, query semantics, or detection policy.
@@ -43,4 +49,5 @@ curl.exe http://127.0.0.1:7478/operator/storage/v1/backend-posture
 curl.exe http://127.0.0.1:7478/operator/storage/v1/snapshot
 curl.exe http://127.0.0.1:7478/operator/storage/v1/filesystem-view
 curl.exe http://127.0.0.1:7478/operator/storage/v1/graph-edges
+curl.exe http://127.0.0.1:7478/operator/storage/v1/source-objects
 ```

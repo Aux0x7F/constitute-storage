@@ -30,6 +30,34 @@ pub struct StoredObjectResponse {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct PutSourceObjectRequest {
+    pub source_graph_ref: String,
+    pub source_snapshot_ref: String,
+    pub storage_member_ref: String,
+    pub manifest: StorageObjectManifest,
+    pub chunks: Vec<PutChunk>,
+    #[serde(default)]
+    pub authority_refs: Vec<String>,
+    #[serde(default = "default_source_object_replicas")]
+    pub desired_replicas: u32,
+    #[serde(default = "default_source_object_retention")]
+    pub retention: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<u64>,
+    pub issued_at: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SourceObjectStorageResponse {
+    pub object: StoredObjectResponse,
+    pub graph_edge: StorageGraphEdge,
+    pub pin_intent: StoragePinIntentResponse,
+    pub pin_attestation: StoragePinAttestationResponse,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct GetObjectResponse {
     pub manifest: StorageObjectManifest,
     pub chunks: Vec<PutChunk>,
@@ -214,4 +242,12 @@ pub struct StorageWatchEvent {
     pub container_id: Option<String>,
     #[serde(default)]
     pub message: String,
+}
+
+fn default_source_object_replicas() -> u32 {
+    1
+}
+
+fn default_source_object_retention() -> String {
+    "source-object".to_string()
 }

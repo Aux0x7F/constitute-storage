@@ -1,4 +1,4 @@
-// domain-owned-vocabulary: storage.availability
+// domain-owned-vocabulary: storage.availability sourceSnapshot.stores
 use axum::extract::ws::{Message, WebSocket};
 use axum::extract::{Path, Query, State, WebSocketUpgrade};
 use axum::http::StatusCode;
@@ -21,7 +21,7 @@ use crate::identity::StorageServiceIdentity;
 use crate::types::{
     MaterializeIndexRequest, PruneRequest, PutGraphEdgeRequest, PutIndexShardRequest,
     PutKeyGrantRequest, PutObjectRequest, PutPinAttestationRequest, PutPinIntentRequest,
-    PutPinRequest,
+    PutPinRequest, PutSourceObjectRequest,
 };
 
 pub(crate) const STORAGE_MEMBER_REF: &str = "service:storage:local";
@@ -119,6 +119,10 @@ pub fn router(engine: StorageEngine, service_identity: StorageServiceIdentity) -
         .route("/operator/storage/v1/pins", post(put_pin))
         .route("/operator/storage/v1/pins/{pin_id}", delete(retract_pin))
         .route(
+            "/operator/storage/v1/source-objects",
+            post(put_source_object),
+        )
+        .route(
             "/operator/storage/v1/backend-posture",
             get(get_backend_posture),
         )
@@ -192,6 +196,7 @@ async fn hosted_service_manifest(State(state): State<ApiState>) -> impl IntoResp
             "pinIntents": "/operator/storage/v1/pin-intents",
             "pinAttestations": "/operator/storage/v1/pin-attestations",
             "pinProjections": "/operator/storage/v1/pin-projections/{intentId}",
+            "sourceObjects": "/operator/storage/v1/source-objects",
             "backendPosture": "/operator/storage/v1/backend-posture",
             "snapshot": "/operator/storage/v1/snapshot",
             "filesystemView": "/operator/storage/v1/filesystem-view",
@@ -545,6 +550,13 @@ async fn get_object(
     Ok(Json(state.engine.get_object(&object_id)?))
 }
 
+async fn put_source_object(
+    State(state): State<ApiState>,
+    Json(request): Json<PutSourceObjectRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    Ok(Json(state.engine.put_source_object(request)?))
+}
+
 async fn logical_delete_object(
     State(state): State<ApiState>,
     Path(object_id): Path<String>,
@@ -747,10 +759,14 @@ mod tests {
     use crate::identity::StorageServiceIdentity;
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
+    use base64::Engine as _;
+    use base64::engine::general_purpose::STANDARD as B64;
     use constitute_protocol::{
-        SWARM_FRAME_VERSION, StorageGraphEdge, StoragePinAttestation, StoragePinIntent,
-        StoragePinStatus, SwarmFrameBody, SwarmRecordRef, ZoneScope, pubkey_from_sk_hex,
-        swarm_frame_id,
+        STORAGE_CHUNK_HASH_ALG, STORAGE_ENCRYPTION_ALG_XCHACHA20POLY1305, STORAGE_OBJECT_HASH_ALG,
+        SWARM_FRAME_VERSION, StorageChunkRef, StorageGraphEdge, StorageObjectManifest,
+        StoragePinAttestation, StoragePinIntent, StoragePinStatus, SwarmFrameBody, SwarmRecordRef,
+        ZoneScope, pubkey_from_sk_hex, storage_chunk_id, storage_ciphertext_hash,
+        storage_object_id, swarm_frame_id,
     };
     use tempfile::tempdir;
     use tower::ServiceExt;
@@ -809,6 +825,37 @@ mod tests {
             status: StoragePinStatus::Pinned,
             expires_at: Some(1_700_000_100_000),
             issued_at: 1_700_000_000_000,
+        }
+    }
+
+    fn source_chunk(bytes: &[u8]) -> crate::types::PutChunk {
+        let hash = storage_ciphertext_hash(bytes);
+        crate::types::PutChunk {
+            chunk_ref: StorageChunkRef {
+                chunk_id: storage_chunk_id(&hash),
+                hash,
+                hash_alg: STORAGE_CHUNK_HASH_ALG.to_string(),
+                size: bytes.len() as u64,
+            },
+            ciphertext_base64: B64.encode(bytes),
+        }
+    }
+
+    fn source_manifest(chunk: &crate::types::PutChunk) -> StorageObjectManifest {
+        let container_id = "storage:container:source-api".to_string();
+        let content_hash = storage_ciphertext_hash(chunk.chunk_ref.hash.as_bytes());
+        StorageObjectManifest {
+            object_id: storage_object_id(&container_id, &content_hash),
+            container_id,
+            content_hash,
+            hash_alg: STORAGE_OBJECT_HASH_ALG.to_string(),
+            encryption_alg: STORAGE_ENCRYPTION_ALG_XCHACHA20POLY1305.to_string(),
+            key_ref: "source:key:api".to_string(),
+            chunks: vec![chunk.chunk_ref.clone()],
+            created_at: 1_700_000_000,
+            media_type: "application/vnd.constitution.source-pack".to_string(),
+            logical_deleted_at: None,
+            tags: vec!["source".to_string()],
         }
     }
 
@@ -1119,6 +1166,62 @@ mod tests {
                 Request::builder()
                     .method("GET")
                     .uri("/operator/storage/v1/graph-edges?containerId=container-source&fromRef=source:snapshot:1&relation=stores")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn operator_source_object_route_stores_object_edge_and_availability() {
+        let dir = tempdir().expect("tempdir");
+        let engine = StorageEngine::open(dir.path()).expect("engine");
+        let app = router(engine, test_identity());
+        let chunk = source_chunk(b"source-api-ciphertext");
+        let manifest = source_manifest(&chunk);
+
+        let create = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/operator/storage/v1/source-objects")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({
+                            "sourceGraphRef": "source:graph:api",
+                            "sourceSnapshotRef": "source:snapshot:api-head",
+                            "storageMemberRef": "service:storage:local",
+                            "manifest": manifest,
+                            "chunks": [chunk],
+                            "authorityRefs": ["authority:source:api"],
+                            "desiredReplicas": 1,
+                            "retention": "source-object",
+                            "expiresAt": 1_700_000_100,
+                            "issuedAt": 1_700_000_000
+                        }))
+                        .expect("source object json"),
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(create.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(create.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let value: Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(value["graphEdge"]["fromRef"], "source:snapshot:api-head");
+        assert_eq!(value["pinAttestation"]["projection"]["status"], "satisfied");
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/operator/storage/v1/graph-edges?containerId=storage:container:source-api&fromRef=source:snapshot:api-head&relation=sourceSnapshot.stores")
                     .body(Body::empty())
                     .expect("request"),
             )
