@@ -1,4 +1,4 @@
-// domain-owned-vocabulary: storage.sqlite3 sourceSnapshot.stores
+// domain-owned-vocabulary: storage.backend.not-ready storage.sqlite3 sourceSnapshot.stores
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -9,9 +9,10 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as B64;
 use constitute_fabric::{HostFabricMemberContributionSpec, build_host_fabric_member_contribution};
 use constitute_protocol::{
-    FABRIC_MEMBER_CONTRIBUTION_DEGRADED, FABRIC_MEMBER_CONTRIBUTION_RUNNING,
-    FABRIC_MEMBER_ROLE_STORAGE_JOURNAL_CACHE, HostFabricMemberContribution,
-    RECORD_RETENTION_RELEASE, RECORD_STORAGE_BACKEND_POSTURE, RECORD_STORAGE_BACKEND_SNAPSHOT,
+    CybersecEvidenceHoldRecord, FABRIC_MEMBER_CONTRIBUTION_DEGRADED,
+    FABRIC_MEMBER_CONTRIBUTION_RUNNING, FABRIC_MEMBER_ROLE_STORAGE_JOURNAL_CACHE,
+    HostFabricMemberContribution, RECORD_CYBERSEC_EVIDENCE_HOLD, RECORD_RETENTION_RELEASE,
+    RECORD_STORAGE_BACKEND_POSTURE, RECORD_STORAGE_BACKEND_SNAPSHOT,
     RECORD_STORAGE_FILESYSTEM_VIEW, RetentionReleasePosture, STORAGE_BACKEND_KIND_LOCAL_FS_SQLITE,
     STORAGE_BACKEND_STATE_DEGRADED, STORAGE_BACKEND_STATE_READY, STORAGE_FILESYSTEM_VIEW_DEGRADED,
     STORAGE_FILESYSTEM_VIEW_READY, StorageBackendPosture, StorageBackendSnapshot,
@@ -19,10 +20,11 @@ use constitute_protocol::{
     StorageObjectManifest, StoragePinAttestation, StoragePinIntent, StoragePinLease,
     StoragePinProjection, StoragePinStatus, SwarmStorageAvailabilityRef, sha256_hex,
     storage_pin_projection_from_intent, storage_pin_projection_from_records,
-    validate_retention_release_posture, validate_storage_backend_posture,
-    validate_storage_backend_snapshot, validate_storage_chunk_ref,
-    validate_storage_filesystem_view, validate_storage_graph_edge, validate_storage_index_shard,
-    validate_storage_manifest, validate_storage_pin_attestation, validate_storage_pin_intent,
+    validate_cybersec_evidence_hold, validate_retention_release_posture,
+    validate_storage_backend_posture, validate_storage_backend_snapshot,
+    validate_storage_chunk_ref, validate_storage_filesystem_view, validate_storage_graph_edge,
+    validate_storage_index_shard, validate_storage_manifest, validate_storage_pin_attestation,
+    validate_storage_pin_intent,
 };
 use rusqlite::{Connection, OptionalExtension, params};
 use tokio::sync::broadcast;
@@ -211,6 +213,69 @@ impl StorageEngine {
         };
         validate_storage_backend_snapshot(&snapshot)?;
         Ok(snapshot)
+    }
+
+    pub fn cybersec_evidence_custody_posture(
+        &self,
+        storage_member_ref: impl AsRef<str>,
+        finding_ref: impl AsRef<str>,
+        processor_report_ref: impl AsRef<str>,
+        subject_ref: impl AsRef<str>,
+        detail_refs: Vec<String>,
+        issued_at: u64,
+    ) -> Result<CybersecEvidenceHoldRecord> {
+        let issued_at = if issued_at == 0 {
+            now_seconds()
+        } else {
+            issued_at
+        };
+        let posture = self.backend_posture(storage_member_ref.as_ref(), issued_at)?;
+        let state = if posture.state == STORAGE_BACKEND_STATE_READY {
+            "holding"
+        } else {
+            "blocked"
+        };
+        let mut blocked_reasons = posture.blocked_reasons.clone();
+        if state == "blocked" && blocked_reasons.is_empty() {
+            blocked_reasons.push("storage.backend.not-ready".to_string());
+        }
+        let hold = CybersecEvidenceHoldRecord {
+            kind: Some(RECORD_CYBERSEC_EVIDENCE_HOLD.to_string()),
+            hold_id: format!(
+                "cybersec:evidence-hold:storage:{}",
+                sha256_hex(format!(
+                    "{}|{}|{}|{}",
+                    finding_ref.as_ref(),
+                    processor_report_ref.as_ref(),
+                    subject_ref.as_ref(),
+                    issued_at
+                ))
+            ),
+            finding_ref: finding_ref.as_ref().to_string(),
+            processor_report_ref: processor_report_ref.as_ref().to_string(),
+            subject_ref: subject_ref.as_ref().to_string(),
+            state: state.to_string(),
+            event_refs: Vec::new(),
+            detail_refs,
+            storage_refs: vec![posture.backend_id.clone(), posture.posture_id.clone()],
+            retention_demand_refs: vec!["retention:cybersec:evidence:storage.local".to_string()],
+            access_group_refs: Vec::new(),
+            evidence_refs: posture.evidence_refs.clone(),
+            safe_facts: serde_json::json!({
+                "custody": "storageFulfillment",
+                "accessAuthority": "notOwned",
+                "threatSemantics": "notOwned",
+                "objectCount": posture.object_count,
+                "chunkCount": posture.chunk_count,
+                "storedBytes": posture.stored_bytes,
+                "missingChunkCount": posture.missing_chunk_count
+            }),
+            blocked_reasons,
+            issued_at,
+            expires_at: Some(issued_at + 60),
+        };
+        validate_cybersec_evidence_hold(&hold)?;
+        Ok(hold)
     }
 
     pub fn host_fabric_storage_contribution(
