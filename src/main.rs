@@ -20,14 +20,6 @@ struct Args {
     swarm_zone_id: String,
 }
 
-fn configured_swarm_edge_endpoint(args: &Args) -> Option<String> {
-    args.swarm_edge_endpoint
-        .clone()
-        .or_else(|| std::env::var("CONSTITUTE_SWARM_EDGE_URL").ok())
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-}
-
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -40,7 +32,7 @@ async fn main() -> Result<()> {
     let args = Args::parse();
     let engine = StorageEngine::open(&args.data_dir)?;
     let identity = StorageServiceIdentity::load_or_create(&args.data_dir)?;
-    if let Some(gateway_endpoint) = configured_swarm_edge_endpoint(&args) {
+    if let Some(gateway_endpoint) = args.swarm_edge_endpoint.clone() {
         let edge_state = api::ApiState {
             engine: engine.clone(),
             service_identity: identity.clone(),
