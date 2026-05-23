@@ -299,7 +299,9 @@ impl StorageEngine {
                 fabric_ref: fabric_ref.as_ref().to_string(),
                 host_ref: host_ref.as_ref().to_string(),
                 member_ref: posture.storage_member_ref.clone(),
+                participant_ref: posture.storage_member_ref.clone(),
                 role: FABRIC_MEMBER_ROLE_STORAGE_JOURNAL_CACHE.to_string(),
+                role_ref: format!("role:{FABRIC_MEMBER_ROLE_STORAGE_JOURNAL_CACHE}"),
                 state: if running {
                     FABRIC_MEMBER_CONTRIBUTION_RUNNING.to_string()
                 } else {
@@ -307,6 +309,12 @@ impl StorageEngine {
                 },
                 contract_ref: posture.backend_id.clone(),
                 subject_ref: posture.backend_id.clone(),
+                module_refs: vec![
+                    "module:storage-journal".to_string(),
+                    "module:storage-cache".to_string(),
+                    posture.backend_kind.clone(),
+                ],
+                source_refs: vec![posture.root_ref.clone()],
                 capability_refs: vec![
                     "capability:storage:journal".to_string(),
                     "capability:storage:cache".to_string(),
