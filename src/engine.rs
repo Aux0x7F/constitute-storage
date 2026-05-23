@@ -222,6 +222,7 @@ impl StorageEngine {
         processor_report_ref: impl AsRef<str>,
         subject_ref: impl AsRef<str>,
         detail_refs: Vec<String>,
+        access_group_refs: Vec<String>,
         issued_at: u64,
     ) -> Result<CybersecEvidenceHoldRecord> {
         let issued_at = if issued_at == 0 {
@@ -259,7 +260,7 @@ impl StorageEngine {
             detail_refs,
             storage_refs: vec![posture.backend_id.clone(), posture.posture_id.clone()],
             retention_demand_refs: vec!["retention:cybersec:evidence:storage.local".to_string()],
-            access_group_refs: Vec::new(),
+            access_group_refs,
             evidence_refs: posture.evidence_refs.clone(),
             safe_facts: serde_json::json!({
                 "custody": "storageFulfillment",

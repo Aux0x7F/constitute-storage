@@ -650,6 +650,7 @@ struct EvidenceCustodyQuery {
     processor_report_ref: Option<String>,
     subject_ref: Option<String>,
     detail_refs: Option<String>,
+    access_group_refs: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -684,6 +685,15 @@ async fn get_evidence_custody(
         .filter(|value| !value.is_empty())
         .map(ToOwned::to_owned)
         .collect::<Vec<_>>();
+    let access_group_refs = query
+        .access_group_refs
+        .as_deref()
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
     Ok(Json(
         state.engine.cybersec_evidence_custody_posture(
             member_ref,
@@ -700,6 +710,7 @@ async fn get_evidence_custody(
                 .as_deref()
                 .unwrap_or("storage:evidence:unspecified"),
             detail_refs,
+            access_group_refs,
             query.now.unwrap_or_else(crate::engine::now_seconds),
         )?,
     ))
@@ -1171,7 +1182,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("GET")
-                    .uri("/operator/storage/v1/evidence-custody?now=1700000000&findingRef=cybersec:finding:1&processorReportRef=processor-report:cybersec:1&subjectRef=logging.events.encryptedDetail&detailRefs=encrypted-detail:logging.default")
+                    .uri("/operator/storage/v1/evidence-custody?now=1700000000&findingRef=cybersec:finding:1&processorReportRef=processor-report:cybersec:1&subjectRef=logging.events.encryptedDetail&detailRefs=encrypted-detail:logging.default&accessGroupRefs=access-group:logging.cybersec.default")
                     .body(Body::empty())
                     .expect("request"),
             )
@@ -1185,6 +1196,10 @@ mod tests {
         validate_cybersec_evidence_hold(&hold).expect("valid evidence hold");
         assert_eq!(hold.state, "holding");
         assert_eq!(hold.detail_refs, vec!["encrypted-detail:logging.default"]);
+        assert_eq!(
+            hold.access_group_refs,
+            vec!["access-group:logging.cybersec.default"]
+        );
         assert_eq!(
             hold.safe_facts["accessAuthority"].as_str(),
             Some("notOwned")
