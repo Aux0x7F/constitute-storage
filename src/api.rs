@@ -126,6 +126,10 @@ pub fn router(engine: StorageEngine, service_identity: StorageServiceIdentity) -
             "/operator/storage/v1/backend-posture",
             get(get_backend_posture),
         )
+        .route(
+            "/operator/storage/v1/evidence-custody",
+            get(get_evidence_custody),
+        )
         .route("/operator/storage/v1/snapshot", get(get_backend_snapshot))
         .route(
             "/operator/storage/v1/filesystem-view",
@@ -640,6 +644,16 @@ struct BackendPostureQuery {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct EvidenceCustodyQuery {
+    now: Option<u64>,
+    finding_ref: Option<String>,
+    processor_report_ref: Option<String>,
+    subject_ref: Option<String>,
+    detail_refs: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct BackendSnapshotQuery {
     now: Option<u64>,
     limit: Option<usize>,
@@ -654,6 +668,41 @@ async fn get_backend_posture(
         member_ref,
         query.now.unwrap_or_else(crate::engine::now_seconds),
     )?))
+}
+
+async fn get_evidence_custody(
+    State(state): State<ApiState>,
+    Query(query): Query<EvidenceCustodyQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    let member_ref = format!("service:storage:{}", state.service_identity.service_pk);
+    let detail_refs = query
+        .detail_refs
+        .as_deref()
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+    Ok(Json(
+        state.engine.cybersec_evidence_custody_posture(
+            member_ref,
+            query
+                .finding_ref
+                .as_deref()
+                .unwrap_or("cybersec:finding:storage-unspecified"),
+            query
+                .processor_report_ref
+                .as_deref()
+                .unwrap_or("processor-report:cybersec-unspecified"),
+            query
+                .subject_ref
+                .as_deref()
+                .unwrap_or("storage:evidence:unspecified"),
+            detail_refs,
+            query.now.unwrap_or_else(crate::engine::now_seconds),
+        )?,
+    ))
 }
 
 async fn get_backend_snapshot(
@@ -762,11 +811,12 @@ mod tests {
     use base64::Engine as _;
     use base64::engine::general_purpose::STANDARD as B64;
     use constitute_protocol::{
-        STORAGE_CHUNK_HASH_ALG, STORAGE_ENCRYPTION_ALG_XCHACHA20POLY1305, STORAGE_OBJECT_HASH_ALG,
-        SWARM_FRAME_VERSION, StorageChunkRef, StorageGraphEdge, StorageObjectManifest,
-        StoragePinAttestation, StoragePinIntent, StoragePinStatus, SwarmFrameBody, SwarmRecordRef,
-        ZoneScope, pubkey_from_sk_hex, storage_chunk_id, storage_ciphertext_hash,
-        storage_object_id, swarm_frame_id,
+        CybersecEvidenceHoldRecord, STORAGE_CHUNK_HASH_ALG,
+        STORAGE_ENCRYPTION_ALG_XCHACHA20POLY1305, STORAGE_OBJECT_HASH_ALG, SWARM_FRAME_VERSION,
+        StorageChunkRef, StorageGraphEdge, StorageObjectManifest, StoragePinAttestation,
+        StoragePinIntent, StoragePinStatus, SwarmFrameBody, SwarmRecordRef, ZoneScope,
+        pubkey_from_sk_hex, storage_chunk_id, storage_ciphertext_hash, storage_object_id,
+        swarm_frame_id, validate_cybersec_evidence_hold,
     };
     use tempfile::tempdir;
     use tower::ServiceExt;
@@ -1109,6 +1159,40 @@ mod tests {
             .await
             .expect("response");
         assert_eq!(snapshot.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn operator_evidence_custody_exposes_storage_fulfillment_without_access_authority() {
+        let dir = tempdir().expect("tempdir");
+        let engine = StorageEngine::open(dir.path()).expect("engine");
+        let app = router(engine, test_identity());
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/operator/storage/v1/evidence-custody?now=1700000000&findingRef=cybersec:finding:1&processorReportRef=processor-report:cybersec:1&subjectRef=logging.events.encryptedDetail&detailRefs=encrypted-detail:logging.default")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let hold: CybersecEvidenceHoldRecord = serde_json::from_slice(&body).expect("hold");
+        validate_cybersec_evidence_hold(&hold).expect("valid evidence hold");
+        assert_eq!(hold.state, "holding");
+        assert_eq!(hold.detail_refs, vec!["encrypted-detail:logging.default"]);
+        assert_eq!(
+            hold.safe_facts["accessAuthority"].as_str(),
+            Some("notOwned")
+        );
+        assert_eq!(
+            hold.safe_facts["threatSemantics"].as_str(),
+            Some("notOwned")
+        );
     }
 
     #[tokio::test]
