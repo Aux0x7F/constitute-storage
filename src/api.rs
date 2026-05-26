@@ -19,12 +19,11 @@ use tower_http::trace::TraceLayer;
 use crate::engine::StorageEngine;
 use crate::identity::StorageServiceIdentity;
 use crate::types::{
-    MaterializeIndexRequest, PruneRequest, PutGraphEdgeRequest, PutIndexShardRequest,
-    PutKeyGrantRequest, PutObjectRequest, PutPinAttestationRequest, PutPinIntentRequest,
-    PutPinRequest, PutSourceObjectRequest,
+    MaterializeIndexRequest, ModuleExecutableInstantiationRequest, ModuleMaterializationRequest,
+    PruneRequest, PutGraphEdgeRequest, PutIndexShardRequest, PutKeyGrantRequest, PutObjectRequest,
+    PutPinAttestationRequest, PutPinIntentRequest, PutPinRequest, PutSourceObjectRequest,
 };
 
-pub(crate) const STORAGE_MEMBER_REF: &str = "service:storage:local";
 pub(crate) const STORAGE_CHANNELS: [&str; 4] = [
     constitute_protocol::RECORD_STORAGE_PIN_INTENT,
     constitute_protocol::RECORD_STORAGE_PIN_ATTESTATION,
@@ -123,6 +122,14 @@ pub fn router(engine: StorageEngine, service_identity: StorageServiceIdentity) -
             post(put_source_object),
         )
         .route(
+            "/operator/storage/v1/module-materializations",
+            post(materialize_module),
+        )
+        .route(
+            "/operator/storage/v1/module-executables",
+            post(instantiate_module_executable),
+        )
+        .route(
             "/operator/storage/v1/backend-posture",
             get(get_backend_posture),
         )
@@ -201,6 +208,8 @@ async fn hosted_service_manifest(State(state): State<ApiState>) -> impl IntoResp
             "pinAttestations": "/operator/storage/v1/pin-attestations",
             "pinProjections": "/operator/storage/v1/pin-projections/{intentId}",
             "sourceObjects": "/operator/storage/v1/source-objects",
+            "moduleMaterializations": "/operator/storage/v1/module-materializations",
+            "moduleExecutables": "/operator/storage/v1/module-executables",
             "backendPosture": "/operator/storage/v1/backend-posture",
             "snapshot": "/operator/storage/v1/snapshot",
             "filesystemView": "/operator/storage/v1/filesystem-view",
@@ -349,7 +358,7 @@ fn response_frame(
         version: SWARM_FRAME_VERSION,
         frame_id: String::new(),
         kind,
-        issuer: STORAGE_MEMBER_REF.to_string(),
+        issuer: service_identity.service_pk.clone(),
         audience: json!({ "actorRef": source_frame.issuer }),
         zone_scope: source_frame.zone_scope.clone().or_else(default_zone_scope),
         issued_at: now,
@@ -394,7 +403,7 @@ fn consume_pin_intent_frame(
     let intent: StoragePinIntent = serde_json::from_value(edge_record_payload(state, frame, now)?)
         .map_err(anyhow::Error::from)?;
     let intent_response = state.engine.put_pin_intent(intent.clone())?;
-    let attestation = attestation_for_intent(&intent, now);
+    let attestation = attestation_for_intent(&intent, &state.service_identity.service_pk, now);
     let attestation_response = state.engine.put_pin_attestation(attestation.clone(), now)?;
     Ok(json!({
         "status": "accepted",
@@ -508,18 +517,22 @@ fn is_hex_pk(value: &str) -> bool {
     value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
-fn attestation_for_intent(intent: &StoragePinIntent, now: u64) -> StoragePinAttestation {
+fn attestation_for_intent(
+    intent: &StoragePinIntent,
+    storage_member_ref: &str,
+    now: u64,
+) -> StoragePinAttestation {
     let attestation_id = format!(
         "storage-pin-attestation-{}",
         sha256_hex(format!(
             "{}|{}|{}",
-            intent.intent_id, intent.manifest_hash, STORAGE_MEMBER_REF
+            intent.intent_id, intent.manifest_hash, storage_member_ref
         ))
     );
     StoragePinAttestation {
         attestation_id: attestation_id.clone(),
         intent_id: intent.intent_id.clone(),
-        storage_member_ref: STORAGE_MEMBER_REF.to_string(),
+        storage_member_ref: storage_member_ref.to_string(),
         accepted_refs: intent.object_refs.clone(),
         availability_refs: intent
             .object_refs
@@ -530,7 +543,7 @@ fn attestation_for_intent(intent: &StoragePinIntent, now: u64) -> StoragePinAtte
                     sha256_hex(format!("{attestation_id}|{object_ref}"))
                 ),
                 object_ref: object_ref.clone(),
-                storage_member_ref: STORAGE_MEMBER_REF.to_string(),
+                storage_member_ref: storage_member_ref.to_string(),
                 expires_at: intent.expires_at,
             })
             .collect(),
@@ -559,6 +572,20 @@ async fn put_source_object(
     Json(request): Json<PutSourceObjectRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
     Ok(Json(state.engine.put_source_object(request)?))
+}
+
+async fn materialize_module(
+    State(state): State<ApiState>,
+    Json(request): Json<ModuleMaterializationRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    Ok(Json(state.engine.materialize_module(request)?))
+}
+
+async fn instantiate_module_executable(
+    State(state): State<ApiState>,
+    Json(request): Json<ModuleExecutableInstantiationRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    Ok(Json(state.engine.instantiate_module_executable(request)?))
 }
 
 async fn logical_delete_object(
@@ -650,6 +677,7 @@ struct EvidenceCustodyQuery {
     processor_report_ref: Option<String>,
     subject_ref: Option<String>,
     detail_refs: Option<String>,
+    access_group_refs: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -663,7 +691,7 @@ async fn get_backend_posture(
     State(state): State<ApiState>,
     Query(query): Query<BackendPostureQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let member_ref = format!("service:storage:{}", state.service_identity.service_pk);
+    let member_ref = state.service_identity.service_pk.clone();
     Ok(Json(state.engine.backend_posture(
         member_ref,
         query.now.unwrap_or_else(crate::engine::now_seconds),
@@ -674,9 +702,18 @@ async fn get_evidence_custody(
     State(state): State<ApiState>,
     Query(query): Query<EvidenceCustodyQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let member_ref = format!("service:storage:{}", state.service_identity.service_pk);
+    let member_ref = state.service_identity.service_pk.clone();
     let detail_refs = query
         .detail_refs
+        .as_deref()
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+    let access_group_refs = query
+        .access_group_refs
         .as_deref()
         .unwrap_or_default()
         .split(',')
@@ -700,6 +737,7 @@ async fn get_evidence_custody(
                 .as_deref()
                 .unwrap_or("storage:evidence:unspecified"),
             detail_refs,
+            access_group_refs,
             query.now.unwrap_or_else(crate::engine::now_seconds),
         )?,
     ))
@@ -709,7 +747,7 @@ async fn get_backend_snapshot(
     State(state): State<ApiState>,
     Query(query): Query<BackendSnapshotQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let member_ref = format!("service:storage:{}", state.service_identity.service_pk);
+    let member_ref = state.service_identity.service_pk.clone();
     Ok(Json(state.engine.backend_snapshot(
         member_ref,
         query.limit.unwrap_or(64),
@@ -721,7 +759,7 @@ async fn get_filesystem_view(
     State(state): State<ApiState>,
     Query(query): Query<BackendSnapshotQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let member_ref = format!("service:storage:{}", state.service_identity.service_pk);
+    let member_ref = state.service_identity.service_pk.clone();
     Ok(Json(state.engine.filesystem_view(
         member_ref,
         query.limit.unwrap_or(64),
@@ -824,6 +862,8 @@ mod tests {
     const STORAGE_TEST_SK: &str =
         "1111111111111111111111111111111111111111111111111111111111111111";
     const ISSUER_TEST_SK: &str = "2222222222222222222222222222222222222222222222222222222222222222";
+    const TEST_OBJECT_REF: &str =
+        "storage:object:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
     fn test_identity() -> StorageServiceIdentity {
         StorageServiceIdentity {
@@ -851,7 +891,7 @@ mod tests {
     fn pin_intent(desired_replicas: u32) -> StoragePinIntent {
         StoragePinIntent {
             intent_id: "intent-edge-1".to_string(),
-            object_refs: vec!["object-raw-1".to_string()],
+            object_refs: vec![TEST_OBJECT_REF.to_string()],
             manifest_hash: "sha256:manifest".to_string(),
             desired_replicas,
             retention: "proof".to_string(),
@@ -861,15 +901,16 @@ mod tests {
     }
 
     fn pin_attestation(attestation_id: &str) -> StoragePinAttestation {
+        let storage_member_ref = pubkey_from_sk_hex(STORAGE_TEST_SK).expect("storage pk");
         StoragePinAttestation {
             attestation_id: attestation_id.to_string(),
             intent_id: "intent-edge-1".to_string(),
-            storage_member_ref: "storage-member-raw-edge".to_string(),
-            accepted_refs: vec!["object-raw-1".to_string()],
+            storage_member_ref: storage_member_ref.clone(),
+            accepted_refs: vec![TEST_OBJECT_REF.to_string()],
             availability_refs: vec![SwarmStorageAvailabilityRef {
                 availability_id: format!("availability-{attestation_id}"),
-                object_ref: "object-raw-1".to_string(),
-                storage_member_ref: "storage-member-raw-edge".to_string(),
+                object_ref: TEST_OBJECT_REF.to_string(),
+                storage_member_ref,
                 expires_at: Some(1_700_000_100_000),
             }],
             status: StoragePinStatus::Pinned,
@@ -1165,13 +1206,14 @@ mod tests {
     async fn operator_evidence_custody_exposes_storage_fulfillment_without_access_authority() {
         let dir = tempdir().expect("tempdir");
         let engine = StorageEngine::open(dir.path()).expect("engine");
-        let app = router(engine, test_identity());
+        let identity = test_identity();
+        let app = router(engine, identity);
 
         let response = app
             .oneshot(
                 Request::builder()
                     .method("GET")
-                    .uri("/operator/storage/v1/evidence-custody?now=1700000000&findingRef=cybersec:finding:1&processorReportRef=processor-report:cybersec:1&subjectRef=logging.events.encryptedDetail&detailRefs=encrypted-detail:logging.default")
+                    .uri("/operator/storage/v1/evidence-custody?now=1700000000&findingRef=cybersec:finding:1&processorReportRef=processor-report:cybersec:1&subjectRef=logging.events.encryptedDetail&detailRefs=encrypted-detail:logging.default&accessGroupRefs=access-group:logging.cybersec.default")
                     .body(Body::empty())
                     .expect("request"),
             )
@@ -1185,6 +1227,10 @@ mod tests {
         validate_cybersec_evidence_hold(&hold).expect("valid evidence hold");
         assert_eq!(hold.state, "holding");
         assert_eq!(hold.detail_refs, vec!["encrypted-detail:logging.default"]);
+        assert_eq!(
+            hold.access_group_refs,
+            vec!["access-group:logging.cybersec.default"]
+        );
         assert_eq!(
             hold.safe_facts["accessAuthority"].as_str(),
             Some("notOwned")
@@ -1224,7 +1270,7 @@ mod tests {
             container_id: "container-source".to_string(),
             from_ref: "source:snapshot:1".to_string(),
             relation: "stores".to_string(),
-            to_ref: "storage:object:source-pack-1".to_string(),
+            to_ref: TEST_OBJECT_REF.to_string(),
             detail_ref: None,
             created_at: 1_700_000_001,
         };
@@ -1262,7 +1308,9 @@ mod tests {
     async fn operator_source_object_route_stores_object_edge_and_availability() {
         let dir = tempdir().expect("tempdir");
         let engine = StorageEngine::open(dir.path()).expect("engine");
-        let app = router(engine, test_identity());
+        let identity = test_identity();
+        let storage_member_ref = identity.service_pk.clone();
+        let app = router(engine, identity);
         let chunk = source_chunk(b"source-api-ciphertext");
         let manifest = source_manifest(&chunk);
 
@@ -1277,7 +1325,7 @@ mod tests {
                         serde_json::to_vec(&json!({
                             "sourceGraphRef": "source:graph:api",
                             "sourceSnapshotRef": "source:snapshot:api-head",
-                            "storageMemberRef": "service:storage:local",
+                            "storageMemberRef": storage_member_ref,
                             "manifest": manifest,
                             "chunks": [chunk],
                             "authorityRefs": ["authority:source:api"],
@@ -1312,6 +1360,63 @@ mod tests {
             .await
             .expect("response");
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn operator_module_materialization_route_emits_storage_posture() {
+        let dir = tempdir().expect("tempdir");
+        let engine = StorageEngine::open(dir.path()).expect("engine");
+        let identity = test_identity();
+        let storage_member_ref = identity.service_pk.clone();
+        let app = router(engine, identity);
+        let chunk = source_chunk(b"module-api-ciphertext");
+        let manifest = source_manifest(&chunk);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/operator/storage/v1/module-materializations")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({
+                            "moduleRef": "module:native-dev:constitute-build",
+                            "sourceGraphRef": "source:graph:native-dev:constitute-build",
+                            "sourceSnapshotRef": "source:snapshot:native-dev:constitute-build:abc",
+                            "contentIndexRef": "content-index:native-dev:constitute-build:abc",
+                            "artifactRef": "artifact:native-dev:constitute-build:abc",
+                            "materializedPathRef": "materialized:path:storage-module:native-dev:constitute-build:abc",
+                            "storageMemberRef": storage_member_ref,
+                            "manifest": manifest,
+                            "chunks": [chunk],
+                            "authorityRefs": ["authority:source-build:operator"],
+                            "desiredReplicas": 1,
+                            "retention": "module-materialization",
+                            "cacheRefs": ["storage:cache:native-dev:constitute-build"],
+                            "expiresAt": 1_700_000_100,
+                            "issuedAt": 1_700_000_000
+                        }))
+                        .expect("module materialization json"),
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let value: Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(
+            value["posture"]["kind"],
+            constitute_protocol::RECORD_STORAGE_MODULE_MATERIALIZATION_POSTURE
+        );
+        assert_eq!(value["posture"]["state"], "materialized");
+        assert_eq!(
+            value["posture"]["safeFacts"]["sourceSemanticOwner"],
+            "notStorage"
+        );
     }
 
     #[test]
