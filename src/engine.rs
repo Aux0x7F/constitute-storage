@@ -13,17 +13,23 @@ use constitute_protocol::{
     FABRIC_MEMBER_CONTRIBUTION_RUNNING, FABRIC_MEMBER_ROLE_STORAGE_JOURNAL_CACHE,
     HostFabricMemberContribution, RECORD_CYBERSEC_EVIDENCE_HOLD, RECORD_RETENTION_RELEASE,
     RECORD_STORAGE_BACKEND_POSTURE, RECORD_STORAGE_BACKEND_SNAPSHOT,
-    RECORD_STORAGE_FILESYSTEM_VIEW, RetentionReleasePosture, STORAGE_BACKEND_KIND_LOCAL_FS_SQLITE,
-    STORAGE_BACKEND_STATE_DEGRADED, STORAGE_BACKEND_STATE_READY, STORAGE_FILESYSTEM_VIEW_DEGRADED,
-    STORAGE_FILESYSTEM_VIEW_READY, StorageBackendPosture, StorageBackendSnapshot,
-    StorageFilesystemEntry, StorageFilesystemView, StorageGraphEdge, StorageKeyGrant,
-    StorageObjectManifest, StoragePinAttestation, StoragePinIntent, StoragePinLease,
-    StoragePinProjection, StoragePinStatus, SwarmStorageAvailabilityRef, sha256_hex,
-    storage_pin_projection_from_intent, storage_pin_projection_from_records,
-    validate_cybersec_evidence_hold, validate_retention_release_posture,
-    validate_storage_backend_posture, validate_storage_backend_snapshot,
-    validate_storage_chunk_ref, validate_storage_filesystem_view, validate_storage_graph_edge,
-    validate_storage_index_shard, validate_storage_manifest, validate_storage_pin_attestation,
+    RECORD_STORAGE_FILESYSTEM_VIEW, RECORD_STORAGE_MODULE_EXECUTABLE_INSTANTIATION_POSTURE,
+    RECORD_STORAGE_MODULE_MATERIALIZATION_POSTURE, RetentionReleasePosture,
+    STORAGE_BACKEND_KIND_LOCAL_FS_SQLITE, STORAGE_BACKEND_STATE_DEGRADED,
+    STORAGE_BACKEND_STATE_READY, STORAGE_FILESYSTEM_VIEW_DEGRADED, STORAGE_FILESYSTEM_VIEW_READY,
+    STORAGE_MODULE_EXECUTABLE_INSTANTIATED, STORAGE_MODULE_MATERIALIZATION_BLOCKED,
+    STORAGE_MODULE_MATERIALIZATION_DEGRADED, STORAGE_MODULE_MATERIALIZATION_MATERIALIZED,
+    StorageBackendPosture, StorageBackendSnapshot, StorageFilesystemEntry, StorageFilesystemView,
+    StorageGraphEdge, StorageKeyGrant, StorageModuleExecutableInstantiationPosture,
+    StorageModuleMaterializationPosture, StorageObjectManifest, StoragePinAttestation,
+    StoragePinIntent, StoragePinLease, StoragePinProjection, StoragePinProjectionStatus,
+    StoragePinStatus, SwarmStorageAvailabilityRef, sha256_hex, storage_pin_projection_from_intent,
+    storage_pin_projection_from_records, validate_cybersec_evidence_hold,
+    validate_retention_release_posture, validate_storage_backend_posture,
+    validate_storage_backend_snapshot, validate_storage_chunk_ref,
+    validate_storage_filesystem_view, validate_storage_graph_edge, validate_storage_index_shard,
+    validate_storage_manifest, validate_storage_module_executable_instantiation_posture,
+    validate_storage_module_materialization_posture, validate_storage_pin_attestation,
     validate_storage_pin_intent,
 };
 use rusqlite::{Connection, OptionalExtension, params};
@@ -31,9 +37,11 @@ use tokio::sync::broadcast;
 use uuid::Uuid;
 
 use crate::types::{
-    GetObjectResponse, GraphEdgeSearchResponse, MaterializedIndexEntry, PruneRequest,
-    PruneResponse, PutChunk, PutIndexShardRequest, PutObjectRequest, PutSourceObjectRequest,
-    SearchResponse, SourceObjectStorageResponse, StorageHealth, StoragePinAttestationResponse,
+    GetObjectResponse, GraphEdgeSearchResponse, MaterializedIndexEntry,
+    ModuleExecutableInstantiationRequest, ModuleExecutableInstantiationResponse,
+    ModuleMaterializationRequest, ModuleMaterializationResponse, PruneRequest, PruneResponse,
+    PutChunk, PutIndexShardRequest, PutObjectRequest, PutSourceObjectRequest, SearchResponse,
+    SourceObjectStorageResponse, StorageHealth, StoragePinAttestationResponse,
     StoragePinIntentResponse, StorageWatchEvent, StoredIndexShardResponse, StoredObjectResponse,
 };
 
@@ -574,7 +582,7 @@ impl StorageEngine {
             ),
             intent_id: pin_intent.intent.intent_id.clone(),
             storage_member_ref: request.storage_member_ref.clone(),
-            accepted_refs: vec![object_ref.clone(), graph_edge.edge_id.clone()],
+            accepted_refs: vec![object_ref.clone()],
             availability_refs: vec![SwarmStorageAvailabilityRef {
                 availability_id: format!(
                     "storage-availability:{}",
@@ -598,6 +606,213 @@ impl StorageEngine {
             pin_intent,
             pin_attestation,
         })
+    }
+
+    pub fn materialize_module(
+        &self,
+        request: ModuleMaterializationRequest,
+    ) -> Result<ModuleMaterializationResponse> {
+        validate_module_materialization_request(&request)?;
+        let now = if request.issued_at == 0 {
+            now_seconds()
+        } else {
+            request.issued_at
+        };
+        let module_ref = request.module_ref.clone();
+        let content_index_ref = request.content_index_ref.clone();
+        let artifact_ref = request.artifact_ref.clone();
+        let materialized_path_ref = request.materialized_path_ref.clone();
+        let storage_member_ref = request.storage_member_ref.clone();
+        let object_ref = storage_object_ref(&request.manifest);
+        let byte_length = request
+            .chunks
+            .iter()
+            .map(|chunk| chunk.chunk_ref.size)
+            .sum();
+        let chunk_count = request.chunks.len() as u64;
+        let cache_refs = if request.cache_refs.is_empty() {
+            vec![format!(
+                "storage:cache:module:{}",
+                storage_virtual_component(&module_ref)
+            )]
+        } else {
+            request.cache_refs.clone()
+        };
+        let conflict_refs = request.conflict_refs.clone();
+        let adapter_residency_refs = request.adapter_residency_refs.clone();
+        let legacy_transition_conflict_refs = request.legacy_transition_conflict_refs.clone();
+        let source_object = self.put_source_object(PutSourceObjectRequest {
+            source_graph_ref: request.source_graph_ref,
+            source_snapshot_ref: request.source_snapshot_ref.clone(),
+            storage_member_ref: request.storage_member_ref,
+            manifest: request.manifest,
+            chunks: request.chunks,
+            authority_refs: request.authority_refs,
+            desired_replicas: request.desired_replicas,
+            retention: request.retention,
+            expires_at: request.expires_at,
+            issued_at: now,
+        })?;
+        let backend_posture = self.backend_posture(&storage_member_ref, now)?;
+        let projection = &source_object.pin_attestation.projection;
+        let availability_refs = projection
+            .availability
+            .iter()
+            .map(|availability| availability.availability_id.clone())
+            .collect::<Vec<_>>();
+        let mut blocked_reasons = backend_posture.blocked_reasons.clone();
+        if projection.status != StoragePinProjectionStatus::Satisfied {
+            blocked_reasons.push(format!(
+                "storage.module.pin.missing-replicas:{}",
+                projection.missing_replicas
+            ));
+        }
+        let state = if backend_posture.state == STORAGE_BACKEND_STATE_READY
+            && projection.status == StoragePinProjectionStatus::Satisfied
+            && blocked_reasons.is_empty()
+        {
+            STORAGE_MODULE_MATERIALIZATION_MATERIALIZED
+        } else if backend_posture.state == STORAGE_BACKEND_STATE_DEGRADED {
+            STORAGE_MODULE_MATERIALIZATION_DEGRADED
+        } else {
+            STORAGE_MODULE_MATERIALIZATION_BLOCKED
+        };
+        let posture = StorageModuleMaterializationPosture {
+            kind: Some(RECORD_STORAGE_MODULE_MATERIALIZATION_POSTURE.to_string()),
+            posture_id: format!(
+                "storage-module-materialization-posture:{}",
+                short_storage_id(&format!("{module_ref}|{artifact_ref}|{now}"))
+            ),
+            storage_member_ref,
+            module_ref: module_ref.clone(),
+            source_snapshot_ref: request.source_snapshot_ref,
+            content_index_ref,
+            artifact_ref,
+            materialization_ref: format!(
+                "storage:module-materialization:{}",
+                short_storage_id(&format!("{module_ref}|{object_ref}|{now}"))
+            ),
+            materialized_path_ref,
+            state: state.to_string(),
+            object_refs: vec![object_ref.clone()],
+            pin_intent_refs: vec![format!(
+                "storage:pin-intent:{}",
+                source_object.pin_intent.intent.intent_id
+            )],
+            pin_attestation_refs: vec![format!(
+                "storage:pin-attestation:{}",
+                source_object.pin_attestation.attestation.attestation_id
+            )],
+            availability_refs,
+            cache_refs,
+            evidence_refs: vec![
+                backend_posture.backend_id,
+                backend_posture.posture_id,
+                source_object.graph_edge.edge_id.clone(),
+            ],
+            conflict_refs,
+            adapter_residency_refs,
+            legacy_transition_conflict_refs,
+            blocked_reasons,
+            byte_length,
+            chunk_count,
+            safe_facts: serde_json::json!({
+                "storageRole": "byteCacheJournal",
+                "sourceTruthOwner": "sourceRefs",
+                "sourceSemanticOwner": "notStorage",
+                "objectCount": 1,
+                "chunkCount": chunk_count,
+                "byteLength": byte_length,
+                "pinProjectionStatus": format!("{:?}", projection.status),
+                "missingReplicas": projection.missing_replicas
+            }),
+            materialized_at: now,
+            expires_at: request.expires_at.or(Some(now + 60)),
+        };
+        validate_storage_module_materialization_posture(&posture)?;
+        Ok(ModuleMaterializationResponse {
+            source_object,
+            posture,
+        })
+    }
+
+    pub fn instantiate_module_executable(
+        &self,
+        request: ModuleExecutableInstantiationRequest,
+    ) -> Result<ModuleExecutableInstantiationResponse> {
+        validate_module_executable_instantiation_request(&request)?;
+        let now = if request.issued_at == 0 {
+            now_seconds()
+        } else {
+            request.issued_at
+        };
+        let object_id = storage_object_id_from_ref(&request.object_ref)?;
+        let object = self.get_object(&object_id)?;
+        let mut object_bytes = Vec::new();
+        for chunk in &object.chunks {
+            let bytes = decode_chunk(chunk)?;
+            validate_storage_chunk_ref(&chunk.chunk_ref, &bytes)?;
+            object_bytes.extend(bytes);
+        }
+        let byte_length = object
+            .manifest
+            .chunks
+            .iter()
+            .map(|chunk| chunk.size)
+            .sum::<u64>();
+        let chunk_count = object.manifest.chunks.len() as u64;
+        let media_type = object.manifest.media_type.clone();
+        let executable_hash = sha256_hex(&object_bytes);
+        let executable_hash_ref = format!("sha256:{executable_hash}");
+        let executable_ref = format!(
+            "executable:module:{}:{}",
+            storage_virtual_component(&request.module_ref),
+            short_storage_id(&executable_hash)
+        );
+        let posture = StorageModuleExecutableInstantiationPosture {
+            kind: Some(RECORD_STORAGE_MODULE_EXECUTABLE_INSTANTIATION_POSTURE.to_string()),
+            posture_id: format!(
+                "storage-module-executable-instantiation-posture:{}",
+                short_storage_id(&format!(
+                    "{}|{}|{}",
+                    request.module_ref, request.object_ref, now
+                ))
+            ),
+            storage_member_ref: request.storage_member_ref,
+            module_ref: request.module_ref,
+            source_snapshot_ref: request.source_snapshot_ref,
+            content_index_ref: request.content_index_ref,
+            artifact_ref: request.artifact_ref,
+            materialization_ref: request.materialization_ref,
+            materialization_posture_ref: request.materialization_posture_ref,
+            object_ref: request.object_ref,
+            executable_ref,
+            executable_hash_ref,
+            media_type: media_type.clone(),
+            state: STORAGE_MODULE_EXECUTABLE_INSTANTIATED.to_string(),
+            evidence_refs: vec![
+                format!("storage:manifest:{}", object.manifest.content_hash),
+                format!("storage:object:{}", object.manifest.object_id),
+            ],
+            conflict_refs: request.conflict_refs,
+            adapter_residency_refs: request.adapter_residency_refs,
+            legacy_transition_conflict_refs: request.legacy_transition_conflict_refs,
+            blocked_reasons: vec![],
+            byte_length,
+            chunk_count,
+            safe_facts: serde_json::json!({
+                "storageRole": "byteCacheJournal",
+                "sourceSemanticOwner": "notStorage",
+                "loadOwner": "runner",
+                "objectAddressed": true,
+                "objectMediaType": media_type,
+                "objectChunkCount": chunk_count
+            }),
+            instantiated_at: now,
+            expires_at: request.expires_at.or(Some(now + 60)),
+        };
+        validate_storage_module_executable_instantiation_posture(&posture)?;
+        Ok(ModuleExecutableInstantiationResponse { posture })
     }
 
     pub fn get_object(&self, object_id: &str) -> Result<GetObjectResponse> {
@@ -1349,8 +1564,31 @@ fn storage_object_ref(manifest: &StorageObjectManifest) -> String {
     format!("storage:object:{}", manifest.object_id)
 }
 
+fn storage_object_id_from_ref(object_ref: &str) -> Result<String> {
+    let object_id = object_ref
+        .trim()
+        .strip_prefix("storage:object:")
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| value.to_string())
+        .ok_or_else(|| anyhow!("storage object ref must start with storage:object:"))?;
+    if object_id.len() == 64 && object_id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        Ok(object_id)
+    } else {
+        Err(anyhow!("storage object ref must be content-addressed"))
+    }
+}
+
 fn short_storage_id(value: &str) -> String {
     sha256_hex(value).chars().take(16).collect()
+}
+
+fn validate_resolved_member_ref(value: &str, context: &str) -> Result<()> {
+    validate_virtual_ref(value, context)?;
+    if value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        Ok(())
+    } else {
+        Err(anyhow!("{context} must be a resolved public key"))
+    }
 }
 
 fn validate_source_object_request(request: &PutSourceObjectRequest) -> Result<()> {
@@ -1359,7 +1597,7 @@ fn validate_source_object_request(request: &PutSourceObjectRequest) -> Result<()
         &request.source_snapshot_ref,
         "source object sourceSnapshotRef",
     )?;
-    validate_virtual_ref(
+    validate_resolved_member_ref(
         &request.storage_member_ref,
         "source object storageMemberRef",
     )?;
@@ -1383,6 +1621,121 @@ fn validate_source_object_request(request: &PutSourceObjectRequest) -> Result<()
         return Err(anyhow!("source object expiresAt must be after issuedAt"));
     }
     validate_ref_slice(&request.authority_refs, "source object authorityRefs")
+}
+
+fn validate_module_materialization_request(request: &ModuleMaterializationRequest) -> Result<()> {
+    validate_virtual_ref(&request.module_ref, "module materialization moduleRef")?;
+    validate_virtual_ref(
+        &request.source_graph_ref,
+        "module materialization sourceGraphRef",
+    )?;
+    validate_virtual_ref(
+        &request.source_snapshot_ref,
+        "module materialization sourceSnapshotRef",
+    )?;
+    validate_virtual_ref(
+        &request.content_index_ref,
+        "module materialization contentIndexRef",
+    )?;
+    validate_virtual_ref(&request.artifact_ref, "module materialization artifactRef")?;
+    validate_virtual_ref(
+        &request.materialized_path_ref,
+        "module materialization materializedPathRef",
+    )?;
+    validate_resolved_member_ref(
+        &request.storage_member_ref,
+        "module materialization storageMemberRef",
+    )?;
+    validate_ref_slice(
+        &request.authority_refs,
+        "module materialization authorityRefs",
+    )?;
+    validate_ref_slice(&request.cache_refs, "module materialization cacheRefs")?;
+    validate_ref_slice(
+        &request.conflict_refs,
+        "module materialization conflictRefs",
+    )?;
+    validate_ref_slice(
+        &request.adapter_residency_refs,
+        "module materialization adapterResidencyRefs",
+    )?;
+    validate_ref_slice(
+        &request.legacy_transition_conflict_refs,
+        "module materialization legacyTransitionConflictRefs",
+    )?;
+    if request.authority_refs.is_empty() {
+        return Err(anyhow!("module materialization requires authorityRefs"));
+    }
+    if request.desired_replicas == 0 {
+        return Err(anyhow!(
+            "module materialization desiredReplicas must be positive"
+        ));
+    }
+    if request.issued_at == 0 {
+        return Err(anyhow!("module materialization missing issuedAt"));
+    }
+    validate_source_object_request(&PutSourceObjectRequest {
+        source_graph_ref: request.source_graph_ref.clone(),
+        source_snapshot_ref: request.source_snapshot_ref.clone(),
+        storage_member_ref: request.storage_member_ref.clone(),
+        manifest: request.manifest.clone(),
+        chunks: request.chunks.clone(),
+        authority_refs: request.authority_refs.clone(),
+        desired_replicas: request.desired_replicas,
+        retention: request.retention.clone(),
+        expires_at: request.expires_at,
+        issued_at: request.issued_at,
+    })
+}
+
+fn validate_module_executable_instantiation_request(
+    request: &ModuleExecutableInstantiationRequest,
+) -> Result<()> {
+    validate_virtual_ref(&request.module_ref, "module executable moduleRef")?;
+    validate_virtual_ref(
+        &request.source_snapshot_ref,
+        "module executable sourceSnapshotRef",
+    )?;
+    validate_virtual_ref(
+        &request.content_index_ref,
+        "module executable contentIndexRef",
+    )?;
+    validate_virtual_ref(&request.artifact_ref, "module executable artifactRef")?;
+    validate_virtual_ref(
+        &request.materialization_ref,
+        "module executable materializationRef",
+    )?;
+    validate_virtual_ref(
+        &request.materialization_posture_ref,
+        "module executable materializationPostureRef",
+    )?;
+    validate_virtual_ref(&request.object_ref, "module executable objectRef")?;
+    storage_object_id_from_ref(&request.object_ref)?;
+    validate_resolved_member_ref(
+        &request.storage_member_ref,
+        "module executable storageMemberRef",
+    )?;
+    validate_ref_slice(&request.conflict_refs, "module executable conflictRefs")?;
+    validate_ref_slice(
+        &request.adapter_residency_refs,
+        "module executable adapterResidencyRefs",
+    )?;
+    validate_ref_slice(
+        &request.legacy_transition_conflict_refs,
+        "module executable legacyTransitionConflictRefs",
+    )?;
+    if request.issued_at == 0 {
+        return Err(anyhow!("module executable missing issuedAt"));
+    }
+    if request
+        .expires_at
+        .is_some_and(|expires_at| expires_at <= request.issued_at)
+    {
+        return Err(anyhow!(
+            "module executable expiresAt must be after issuedAt"
+        ));
+    }
+    Ok(())
 }
 
 fn validate_ref_slice(refs: &[String], context: &str) -> Result<()> {
@@ -1576,6 +1929,15 @@ mod tests {
 
     use super::*;
 
+    const TEST_STORAGE_MEMBER_REF: &str =
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const TEST_STORAGE_MEMBER_REF_TWO: &str =
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    const TEST_OBJECT_REF: &str =
+        "storage:object:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+    const TEST_APP_OBJECT_REF: &str =
+        "storage:object:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+
     fn chunk(bytes: &[u8]) -> PutChunk {
         let hash = storage_ciphertext_hash(bytes);
         PutChunk {
@@ -1640,7 +2002,7 @@ mod tests {
             .put_source_object(PutSourceObjectRequest {
                 source_graph_ref: "source:graph:constitute-git".to_string(),
                 source_snapshot_ref: "source:snapshot:head".to_string(),
-                storage_member_ref: "service:storage:local".to_string(),
+                storage_member_ref: TEST_STORAGE_MEMBER_REF.to_string(),
                 manifest: manifest.clone(),
                 chunks: vec![chunk.clone()],
                 authority_refs: vec!["authority:source:graph".to_string()],
@@ -1684,10 +2046,153 @@ mod tests {
             .expect("source object graph edges");
         assert_eq!(edges.edges, vec![response.graph_edge]);
         let posture = engine
-            .backend_posture("service:storage:local", 1_700_000_001)
+            .backend_posture(TEST_STORAGE_MEMBER_REF, 1_700_000_001)
             .expect("backend posture");
         assert_eq!(posture.pin_intent_count, 1);
         assert_eq!(posture.pin_attestation_count, 1);
+    }
+
+    #[test]
+    fn module_materialization_stores_bytes_and_emits_storage_posture() {
+        let dir = tempdir().expect("tempdir");
+        let engine = StorageEngine::open(dir.path()).expect("engine");
+        let chunk = chunk(b"module-source-pack-ciphertext");
+        let manifest = manifest(
+            "storage:container:module-pack",
+            "source:key:module-pack",
+            &chunk,
+        );
+
+        let response = engine
+            .materialize_module(ModuleMaterializationRequest {
+                module_ref: "module:native-dev:constitute-build".to_string(),
+                source_graph_ref: "source:graph:native-dev:constitute-build".to_string(),
+                source_snapshot_ref: "source:snapshot:native-dev:constitute-build:abc".to_string(),
+                content_index_ref: "content-index:native-dev:constitute-build:abc".to_string(),
+                artifact_ref: "artifact:native-dev:constitute-build:abc".to_string(),
+                materialized_path_ref:
+                    "materialized:path:storage-module:native-dev:constitute-build:abc".to_string(),
+                storage_member_ref: TEST_STORAGE_MEMBER_REF.to_string(),
+                manifest: manifest.clone(),
+                chunks: vec![chunk],
+                authority_refs: vec!["authority:source-build:operator".to_string()],
+                desired_replicas: 1,
+                retention: "module-materialization".to_string(),
+                cache_refs: vec!["storage:cache:native-dev:constitute-build".to_string()],
+                conflict_refs: vec![
+                    "transition-conflict:constitute-build:cargo-git:constitute-protocol"
+                        .to_string(),
+                ],
+                adapter_residency_refs: vec![
+                    "transition-conflict:constitute-fabric:cargo-path:constitute-protocol"
+                        .to_string(),
+                ],
+                legacy_transition_conflict_refs: vec![
+                    "transition-conflict:constitute-fabric:cargo-path:constitute-protocol"
+                        .to_string(),
+                ],
+                expires_at: Some(1_700_000_100),
+                issued_at: 1_700_000_000,
+            })
+            .expect("materialize module");
+
+        assert_eq!(
+            response.posture.kind.as_deref(),
+            Some(RECORD_STORAGE_MODULE_MATERIALIZATION_POSTURE)
+        );
+        assert_eq!(
+            response.posture.state,
+            STORAGE_MODULE_MATERIALIZATION_MATERIALIZED
+        );
+        assert_eq!(
+            response.posture.source_snapshot_ref,
+            "source:snapshot:native-dev:constitute-build:abc"
+        );
+        assert_eq!(
+            response.posture.object_refs,
+            vec![format!("storage:object:{}", manifest.object_id)]
+        );
+        assert_eq!(response.posture.chunk_count, 1);
+        assert_eq!(
+            response.posture.adapter_residency_refs,
+            vec!["transition-conflict:constitute-fabric:cargo-path:constitute-protocol"]
+        );
+        assert_eq!(
+            response.posture.legacy_transition_conflict_refs,
+            response.posture.adapter_residency_refs
+        );
+        assert_eq!(
+            response.posture.safe_facts["sourceSemanticOwner"],
+            "notStorage"
+        );
+        assert!(
+            serde_json::to_string(&response.posture)
+                .expect("posture json")
+                .contains("storage:pin-attestation:")
+        );
+        assert!(
+            !serde_json::to_string(&response.posture)
+                .expect("posture json")
+                .contains(dir.path().to_string_lossy().as_ref())
+        );
+
+        let executable = engine
+            .instantiate_module_executable(ModuleExecutableInstantiationRequest {
+                module_ref: response.posture.module_ref.clone(),
+                source_snapshot_ref: response.posture.source_snapshot_ref.clone(),
+                content_index_ref: response.posture.content_index_ref.clone(),
+                artifact_ref: response.posture.artifact_ref.clone(),
+                materialization_ref: response.posture.materialization_ref.clone(),
+                materialization_posture_ref: response.posture.posture_id.clone(),
+                object_ref: response.posture.object_refs[0].clone(),
+                storage_member_ref: TEST_STORAGE_MEMBER_REF.to_string(),
+                conflict_refs: response.posture.conflict_refs.clone(),
+                adapter_residency_refs: response.posture.adapter_residency_refs.clone(),
+                legacy_transition_conflict_refs: response
+                    .posture
+                    .legacy_transition_conflict_refs
+                    .clone(),
+                expires_at: Some(1_700_000_100),
+                issued_at: 1_700_000_001,
+            })
+            .expect("instantiate executable bytes");
+
+        assert_eq!(
+            executable.posture.kind.as_deref(),
+            Some(RECORD_STORAGE_MODULE_EXECUTABLE_INSTANTIATION_POSTURE)
+        );
+        assert_eq!(
+            executable.posture.state,
+            STORAGE_MODULE_EXECUTABLE_INSTANTIATED
+        );
+        assert_eq!(
+            executable.posture.object_ref,
+            response.posture.object_refs[0]
+        );
+        assert!(
+            executable
+                .posture
+                .executable_hash_ref
+                .starts_with("sha256:")
+        );
+        assert_eq!(executable.posture.safe_facts["loadOwner"], "runner");
+        assert_eq!(
+            executable.posture.adapter_residency_refs,
+            response.posture.adapter_residency_refs
+        );
+        assert_eq!(
+            executable.posture.legacy_transition_conflict_refs,
+            response.posture.legacy_transition_conflict_refs
+        );
+        assert_eq!(
+            executable.posture.safe_facts["sourceSemanticOwner"],
+            "notStorage"
+        );
+        assert!(
+            !serde_json::to_string(&executable.posture)
+                .expect("executable posture json")
+                .contains(dir.path().to_string_lossy().as_ref())
+        );
     }
 
     #[test]
@@ -1986,7 +2491,7 @@ mod tests {
         engine.put_pin_intent(pin_intent()).expect("put intent");
 
         let posture = engine
-            .backend_posture("service:storage:local", 1_700_000_001)
+            .backend_posture(TEST_STORAGE_MEMBER_REF, 1_700_000_001)
             .expect("backend posture");
         assert_eq!(posture.state, STORAGE_BACKEND_STATE_READY);
         assert_eq!(posture.object_count, 1);
@@ -1999,7 +2504,7 @@ mod tests {
         );
 
         let snapshot = engine
-            .backend_snapshot("service:storage:local", 8, 1_700_000_001)
+            .backend_snapshot(TEST_STORAGE_MEMBER_REF, 8, 1_700_000_001)
             .expect("backend snapshot");
         assert_eq!(snapshot.object_count, 1);
         assert_eq!(snapshot.pin_lease_count, 1);
@@ -2031,7 +2536,7 @@ mod tests {
             .expect("put object");
 
         let view = engine
-            .filesystem_view("service:storage:local", 8, 1_700_000_001)
+            .filesystem_view(TEST_STORAGE_MEMBER_REF, 8, 1_700_000_001)
             .expect("filesystem view");
 
         assert_eq!(view.state, STORAGE_FILESYSTEM_VIEW_READY);
@@ -2059,7 +2564,7 @@ mod tests {
             container_id: "container-source".to_string(),
             from_ref: "source:tree:root".to_string(),
             relation: "contains".to_string(),
-            to_ref: "storage:object:source-pack-1".to_string(),
+            to_ref: TEST_OBJECT_REF.to_string(),
             detail_ref: None,
             created_at: 1_700_000_001,
         };
@@ -2094,7 +2599,7 @@ mod tests {
     fn pin_intent() -> StoragePinIntent {
         StoragePinIntent {
             intent_id: "intent-1".to_string(),
-            object_refs: vec!["object-raw-1".to_string()],
+            object_refs: vec![TEST_OBJECT_REF.to_string()],
             manifest_hash: "sha256:manifest".to_string(),
             desired_replicas: 2,
             retention: "proof".to_string(),
@@ -2113,10 +2618,10 @@ mod tests {
             attestation_id: attestation_id.to_string(),
             intent_id: "intent-1".to_string(),
             storage_member_ref: member_ref.to_string(),
-            accepted_refs: vec!["object-raw-1".to_string()],
+            accepted_refs: vec![TEST_OBJECT_REF.to_string()],
             availability_refs: vec![SwarmStorageAvailabilityRef {
                 availability_id: format!("availability-{attestation_id}"),
-                object_ref: "object-raw-1".to_string(),
+                object_ref: TEST_OBJECT_REF.to_string(),
                 storage_member_ref: member_ref.to_string(),
                 expires_at,
             }],
@@ -2155,7 +2660,7 @@ mod tests {
             .put_pin_attestation(
                 pin_attestation(
                     "attestation-1",
-                    "storage-member-raw-2",
+                    TEST_STORAGE_MEMBER_REF_TWO,
                     StoragePinStatus::Accepted,
                     Some(1_700_000_100_000),
                 ),
@@ -2169,7 +2674,7 @@ mod tests {
             .put_pin_attestation(
                 pin_attestation(
                     "attestation-2",
-                    "storage-member-raw-1",
+                    TEST_STORAGE_MEMBER_REF,
                     StoragePinStatus::Pinned,
                     Some(1_700_000_100_000),
                 ),
@@ -2185,8 +2690,8 @@ mod tests {
         assert_eq!(
             second.projection.members,
             vec![
-                "storage-member-raw-1".to_string(),
-                "storage-member-raw-2".to_string()
+                TEST_STORAGE_MEMBER_REF.to_string(),
+                TEST_STORAGE_MEMBER_REF_TWO.to_string()
             ]
         );
     }
@@ -2197,7 +2702,7 @@ mod tests {
         let engine = StorageEngine::open(dir.path()).expect("engine");
         let intent = StoragePinIntent {
             intent_id: "intent-surface-app-release".to_string(),
-            object_refs: vec!["storage:object:surface-app:nvr-ui@0.2.0".to_string()],
+            object_refs: vec![TEST_APP_OBJECT_REF.to_string()],
             manifest_hash: "sha256:surface-app-manifest:nvr-ui:0.2.0".to_string(),
             desired_replicas: 1,
             retention: "app-release".to_string(),
@@ -2216,12 +2721,12 @@ mod tests {
                 StoragePinAttestation {
                     attestation_id: "attestation-surface-app-release".to_string(),
                     intent_id: "intent-surface-app-release".to_string(),
-                    storage_member_ref: "storage-member-surface-app".to_string(),
-                    accepted_refs: vec!["storage:object:surface-app:nvr-ui@0.2.0".to_string()],
+                    storage_member_ref: TEST_STORAGE_MEMBER_REF.to_string(),
+                    accepted_refs: vec![TEST_APP_OBJECT_REF.to_string()],
                     availability_refs: vec![SwarmStorageAvailabilityRef {
                         availability_id: "availability-surface-app-release".to_string(),
-                        object_ref: "storage:object:surface-app:nvr-ui@0.2.0".to_string(),
-                        storage_member_ref: "storage-member-surface-app".to_string(),
+                        object_ref: TEST_APP_OBJECT_REF.to_string(),
+                        storage_member_ref: TEST_STORAGE_MEMBER_REF.to_string(),
                         expires_at: Some(1_700_000_100_000),
                     }],
                     status: StoragePinStatus::Pinned,
@@ -2248,7 +2753,7 @@ mod tests {
             .put_pin_attestation(
                 pin_attestation(
                     "attestation-1",
-                    "storage-member-raw-1",
+                    TEST_STORAGE_MEMBER_REF,
                     StoragePinStatus::Accepted,
                     Some(1_700_000_000_010),
                 ),

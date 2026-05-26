@@ -1,6 +1,7 @@
 use constitute_protocol::{
     EncryptedDetailRef, RetentionReleasePosture, StorageChunkRef, StorageGraphEdge,
-    StorageIndexShard, StorageKeyGrant, StorageObjectManifest, StoragePinAttestation,
+    StorageIndexShard, StorageKeyGrant, StorageModuleExecutableInstantiationPosture,
+    StorageModuleMaterializationPosture, StorageObjectManifest, StoragePinAttestation,
     StoragePinIntent, StoragePinLease, StoragePinProjection,
 };
 use serde::{Deserialize, Serialize};
@@ -54,6 +55,72 @@ pub struct SourceObjectStorageResponse {
     pub graph_edge: StorageGraphEdge,
     pub pin_intent: StoragePinIntentResponse,
     pub pin_attestation: StoragePinAttestationResponse,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModuleMaterializationRequest {
+    pub module_ref: String,
+    pub source_graph_ref: String,
+    pub source_snapshot_ref: String,
+    pub content_index_ref: String,
+    pub artifact_ref: String,
+    pub materialized_path_ref: String,
+    pub storage_member_ref: String,
+    pub manifest: StorageObjectManifest,
+    pub chunks: Vec<PutChunk>,
+    #[serde(default)]
+    pub authority_refs: Vec<String>,
+    #[serde(default = "default_module_replicas")]
+    pub desired_replicas: u32,
+    #[serde(default = "default_module_materialization_retention")]
+    pub retention: String,
+    #[serde(default)]
+    pub cache_refs: Vec<String>,
+    #[serde(default)]
+    pub conflict_refs: Vec<String>,
+    #[serde(default)]
+    pub adapter_residency_refs: Vec<String>,
+    #[serde(default)]
+    pub legacy_transition_conflict_refs: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<u64>,
+    pub issued_at: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModuleMaterializationResponse {
+    pub source_object: SourceObjectStorageResponse,
+    pub posture: StorageModuleMaterializationPosture,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModuleExecutableInstantiationRequest {
+    pub module_ref: String,
+    pub source_snapshot_ref: String,
+    pub content_index_ref: String,
+    pub artifact_ref: String,
+    pub materialization_ref: String,
+    pub materialization_posture_ref: String,
+    pub object_ref: String,
+    pub storage_member_ref: String,
+    #[serde(default)]
+    pub conflict_refs: Vec<String>,
+    #[serde(default)]
+    pub adapter_residency_refs: Vec<String>,
+    #[serde(default)]
+    pub legacy_transition_conflict_refs: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<u64>,
+    pub issued_at: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModuleExecutableInstantiationResponse {
+    pub posture: StorageModuleExecutableInstantiationPosture,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -250,4 +317,12 @@ fn default_source_object_replicas() -> u32 {
 
 fn default_source_object_retention() -> String {
     "source-object".to_string()
+}
+
+fn default_module_replicas() -> u32 {
+    1
+}
+
+fn default_module_materialization_retention() -> String {
+    "module-materialization".to_string()
 }

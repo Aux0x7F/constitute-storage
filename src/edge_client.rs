@@ -4,11 +4,10 @@ use constitute_fabric::{
     GatewayWebSocketCarrierSessionEvidenceInput, build_gateway_websocket_carrier_session_evidence,
 };
 use constitute_protocol::{
-    CAPABILITY_SWARM_EDGE_ATTACH, CARRIER_EDGE_SESSION_OPEN, CarrierEdgeSessionEvidence,
-    SWARM_EDGE_WIRE_ACCEPT, SWARM_EDGE_WIRE_HELLO, SWARM_EDGE_WIRE_RESUME, SWARM_FRAME_VERSION,
-    SWARM_WIRE_FRAME, SwarmAck, SwarmEdgeAccept, SwarmEdgeHello, SwarmFrame, SwarmFrameBody,
-    SwarmFrameKind, ZoneScope, seal_envelope, swarm_frame_id,
-    validate_carrier_edge_session_evidence, validate_swarm_edge_hello, validate_swarm_frame,
+    CAPABILITY_SWARM_EDGE_ATTACH, CarrierEdgeSessionEvidence, SWARM_EDGE_WIRE_ACCEPT,
+    SWARM_EDGE_WIRE_HELLO, SWARM_EDGE_WIRE_RESUME, SWARM_FRAME_VERSION, SWARM_WIRE_FRAME, SwarmAck,
+    SwarmEdgeAccept, SwarmEdgeHello, SwarmFrame, SwarmFrameBody, SwarmFrameKind, ZoneScope,
+    seal_envelope, swarm_frame_id, validate_swarm_edge_hello, validate_swarm_frame,
 };
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
@@ -784,7 +783,8 @@ mod tests {
         };
         let evidence = storage_carrier_edge_session_evidence(&accept, 1_700_000_000_011)
             .expect("carrier evidence");
-        validate_carrier_edge_session_evidence(&evidence).expect("valid carrier evidence");
+        constitute_protocol::validate_carrier_edge_session_evidence(&evidence)
+            .expect("valid carrier evidence");
         assert_eq!(
             evidence.adapter_ref,
             "adapter:gateway-association:websocket"
@@ -793,7 +793,10 @@ mod tests {
             evidence.participant_ref,
             format!("service:storage:{service_pk}")
         );
-        assert_eq!(evidence.state, CARRIER_EDGE_SESSION_OPEN);
+        assert_eq!(
+            evidence.state,
+            constitute_protocol::CARRIER_EDGE_SESSION_OPEN
+        );
     }
 
     #[test]
